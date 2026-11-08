@@ -1,6 +1,6 @@
 [package]
 name = "openidea-plugin-yii2-support"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 publish = false
 
@@ -12,6 +12,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 openidea-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.37" }
+lazy_static = "1.4"
+# Performance optimizations
+ahash = { version = "0.8", features = ["compile-time-rng"] }  # Faster hashing for HashMap/HashSet
+parking_lot = "0.12"  # Faster locking primitives
 
 [profile.release]
 opt-level = "s"

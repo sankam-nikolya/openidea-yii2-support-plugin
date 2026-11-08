@@ -2,22 +2,28 @@
 
 Port of core features from [nvlad/yii2support](https://github.com/nvlad/yii2support) for OpenIDEA.
 
-## Status (0.1.6)
+## Status (0.1.7)
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Views** — completion in `render()` / `renderPartial()` | ✅ | Scans `**/views/**/*.php`, priority from controller |
 | **Views** — Go to Definition from controller/module | ✅ | `//`, `/`, `@app`, relative + module path |
 | **Views** — missing view diagnostics + quick-fix | ⚠️ | Code action exists; file creation limited by API |
+| **Views** — Create view from render() with params | ⚠️ | Generates content with @var annotations; manual file creation needed |
 | **Controllers** — index `*Controller.php` | ✅ | id, module, view_path, actions |
 | **Routes** — `Url::to` / `redirect` / `Html::a` | ✅ | Completion + Go to controller |
 | **Routes with parameters** | ✅ | `<id:\d+>`, param keys in array, action signature |
 | **urlManager rules** | ✅ | Scans config, pattern → route + params |
+| **Absolute routes** (`/module/controller/action`) | ✅ | Supported in Url::to, redirect, Html::a |
+| **REST patterns** (`['POST', 'route']`) | ✅ | Verb-prefixed route arrays supported |
+| **Exact action line navigation** | ✅ | Go to route → opens controller at `actionX` line |
 | **i18n** — `Yii::t()` category | ✅ | From message files + app/yii |
 | **i18n** — message keys | ✅ | Scans `messages/**/*.php` |
 | **ActiveRecord / Forms** — attributes | ✅ | Indexes models + type hints / `@var` / `new` |
 | **rules() / attributes() / scenarios()** | ✅ | Extraction from model methods |
 | **Config arrays** (`'class' => …`) | ✅ | Common Yii components |
+| **Console commands** — `yii migrate` / `migrate/create` | ✅ | Via PHP process execution |
+| **Index invalidation** | ⚠️ | Version-based cache invalidation; file-saved hook needed |
 | Database / ActiveQuery / Migrations UI | ❌ | Requires deep DB / process access |
 
 ## Build
@@ -139,11 +145,9 @@ Completion shows relative names for current controller first.
 ## Future Development
 
 1. Background document indexer (controller ↔ view gutter, route ↔ action line).
-2. Write API — actual view creation + params.
-3. Migration helper via `process:php` + yii console.
-4. Index invalidation on `file-saved` instead of only TTL.
-5. Navigate to exact `actionX` line in controller (currently — file start).
-6. Support `['/module/controller/action']` and REST patterns in rules.
+2. Write API — actual view file creation via editor.write API.
+3. Index invalidation on `file-saved` event (currently version-based invalidation works, needs editor save hook).
+4. Support for more REST patterns and complex urlManager rules.
 
 ## License
 

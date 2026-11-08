@@ -17,6 +17,170 @@
       "type": "boolean",
       "default": true,
       "description": "Report missing view templates as problems."
+    },
+    "scanPaths.controllers": {
+      "type": "string",
+      "default": "controllers,modules/*/controllers",
+      "description": "Comma-separated directories to scan for Controller classes (relative to project root)."
+    },
+    "scanPaths.models": {
+      "type": "string",
+      "default": "models,modules/*/models,forms,modules/*/forms",
+      "description": "Comma-separated directories to scan for Model/Form classes."
+    },
+    "scanPaths.views": {
+      "type": "string",
+      "default": "views,modules/*/views",
+      "description": "Comma-separated directories to scan for view files."
+    },
+    "scanPaths.messages": {
+      "type": "string",
+      "default": "messages,modules/*/messages",
+      "description": "Comma-separated directories to scan for i18n message files."
+    },
+    "scanPaths.assets": {
+      "type": "string",
+      "default": "assets,modules/*/assets",
+      "description": "Comma-separated directories to scan for AssetBundle classes."
+    },
+    "scanPaths.widgets": {
+      "type": "string",
+      "default": "widgets,components,modules/*/widgets",
+      "description": "Comma-separated directories to scan for Widget classes."
+    },
+    "scanPaths.commands": {
+      "type": "string",
+      "default": "commands,modules/*/commands",
+      "description": "Comma-separated directories to scan for Console Command classes."
+    },
+    "scanPaths.migrations": {
+      "type": "string",
+      "default": "migrations,modules/*/migrations,console/migrations",
+      "description": "Comma-separated directories to scan for migration files."
+    },
+    "scanPaths.config": {
+      "type": "string",
+      "default": "config,common/config,frontend/config,backend/config,console/config",
+      "description": "Comma-separated directories to scan for config files (aliases, components, urlManager)."
+    },
+    "features.views": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable view completion and navigation."
+    },
+    "features.routes": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable route completion and navigation."
+    },
+    "features.models": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable model/form attribute completion."
+    },
+    "features.i18n": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable i18n category and message key completion."
+    },
+    "features.components": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable Yii::$app->component completion."
+    },
+    "features.aliases": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable alias (@app, @runtime, etc.) completion and resolution."
+    },
+    "features.assets": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable asset bundle (JS/CSS) completion and navigation."
+    },
+    "features.console": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable console command completion."
+    },
+    "features.migrations": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable migration file indexing."
+    },
+    "features.behaviors": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable behavior() method completion."
+    },
+    "features.widgets": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable widget class completion."
+    },
+    "features.activeFormJs": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable Yii2 ActiveForm JS completion (yii.activeForm)."
+    },
+    "performance.maxScanFiles": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 500,
+      "default": 25,
+      "description": "Maximum files to scan per index build (higher = more complete, slower)."
+    },
+    "performance.maxFileSizeKb": {
+      "type": "integer",
+      "minimum": 8,
+      "maximum": 512,
+      "default": 32,
+      "description": "Maximum file size (KB) to parse for indexing."
+    },
+    "performance.maxCompletions": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 200,
+      "default": 32,
+      "description": "Maximum completion items to return."
+    },
+    "performance.cacheTtlSeconds": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 300,
+      "default": 30,
+      "description": "Cache TTL in seconds (lower = fresher, higher = faster)."
+    },
+    "performance.enableOpBudget": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable operation budget to prevent WASM timeout (50ms limit)."
+    },
+    "advanced.projectType": {
+      "type": "string",
+      "enum": ["basic", "advanced", "custom"],
+      "default": "basic",
+      "description": "Yii2 project template type (affects default scan paths)."
+    },
+    "advanced.moduleDetection": {
+      "type": "boolean",
+      "default": true,
+      "description": "Automatically detect modules from directory structure."
+    },
+    "advanced.urlManagerConfigKeys": {
+      "type": "string",
+      "default": "urlManager,components.urlManager",
+      "description": "Comma-separated config keys where urlManager rules are defined."
+    },
+    "advanced.customAliases": {
+      "type": "string",
+      "default": "{}",
+      "description": "Additional custom aliases as JSON string (e.g., '{\"@vendor\": \"/path/to/vendor\"}')."
+    },
+    "advanced.ignoredPaths": {
+      "type": "string",
+      "default": "vendor,runtime,.git,node_modules,tests/_output",
+      "description": "Comma-separated paths to ignore during scanning (glob patterns)."
     }
   }
 }

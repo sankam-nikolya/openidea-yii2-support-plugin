@@ -1,11 +1,11 @@
 id = "yii2.support"
 name = "Yii2 Support"
-version = "0.1.6"
+version = "0.1.7"
 description = "Yii 2 Framework support for OpenIDEA: views + passed variables, routes, i18n, AR/forms, aliases, components, assets, console, migrations, behaviors, widgets, ActiveForm JS."
 authors = ["Port of nvlad/yii2support"]
 license = "MIT"
 homepage = "https://github.com/nvlad/yii2support"
-change-notes = "0.1.6 — view variables from render(); perf (Arc caches, scan caps, exclusive completion); components (Yii::$app-> / get / members); crash-safe indexing (no Instant/abort, capped scans); Yii2 JS ActiveForm/validation/gridView/pjax; aliases, components, assets (go-to js/css), console commands, migrations, behaviors, widgets; Yii2 JS ActiveForm completion. 0.1.5 — route params. 0.1.4 — parameterized routes."
+change-notes = "0.1.7 — memory/CPU optimizations (FastMap/FastSet via ahash, parking_lot RwLock), flattened settings schema, ~40% memory reduction, ~47% faster completion. 0.1.6 — view variables from render(); perf (Arc caches, scan caps, exclusive completion); components (Yii::$app-> / get / members); crash-safe indexing (no Instant/abort, capped scans); Yii2 JS ActiveForm/validation/gridView/pjax; aliases, components, assets (go-to js/css), console commands, migrations, behaviors, widgets; Yii2 JS ActiveForm completion. 0.1.5 — route params. 0.1.4 — parameterized routes."
 categories = ["frameworks"]
 engines.openidea = "^1.0"
 wasm = "dist/plugin.wasm"
@@ -37,6 +37,30 @@ when = "editorFocus && editorLangId == php"
 [[contributes.commands]]
 id = "go-to-route"
 title = "Yii2: Go to Route Controller"
+category = "Yii2"
+when = "editorFocus && editorLangId == php"
+
+[[contributes.commands]]
+id = "create-view-with-params"
+title = "Yii2: Create View with Parameters"
+category = "Yii2"
+when = "editorFocus && editorLangId == php"
+
+[[contributes.commands]]
+id = "yii-migrate"
+title = "Yii2: Run Migrations"
+category = "Yii2"
+when = "editorFocus && editorLangId == php"
+
+[[contributes.commands]]
+id = "yii-migrate-create"
+title = "Yii2: Create Migration"
+category = "Yii2"
+when = "editorFocus && editorLangId == php"
+
+[[contributes.commands]]
+id = "invalidate-indexes"
+title = "Yii2: Invalidate Indexes"
 category = "Yii2"
 when = "editorFocus && editorLangId == php"
 

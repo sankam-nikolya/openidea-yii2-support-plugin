@@ -16,14 +16,23 @@ use openidea_plugin::{
     Error, Invocation, Location, NotificationLevel, Plugin, Position, Project, Range,
     register_plugin,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::hash::BuildHasherDefault;
+use ahash::AHasher;
+use parking_lot::RwLock;
+use lazy_static::lazy_static;
+
+/// Type alias for fast HashMap using ahash
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<AHasher>>;
+/// Type alias for fast HashSet using ahash
+type FastSet<T> = HashSet<T, BuildHasherDefault<AHasher>>;
 
 /// Hard caps — host allows ~50ms for providers; stay well under that.
 const MAX_SCAN: u32 = 25;           // Drastically reduced for timeout prevention
 const MAX_FILE_BYTES: usize = 32 * 1024;  // Reduced to 32KB
 const MAX_COMPLETION: usize = 32;
-const MAX_CONFIG_FILES: usize = 6;  // Drastically reduced
+const MAX_CONFIG_FILES: u32 = 6;  // Drastically reduced
 const MAX_ASSET_SCAN: u32 = 15;     // Drastically reduced
 const VIEW_CODE: &str = "yii2-missing-view";
 
@@ -36,6 +45,58 @@ const MAX_OPS: u32 = 100;
 #[derive(Default)]
 struct OpBudget {
     ops: u32,
+}
+
+/// Cache invalidation event for file-saved notifications.
+#[derive(Clone, Debug)]
+enum CacheInvalidation {
+    Controllers,
+    Views,
+    Models,
+    Messages,
+    UrlRules,
+    AliasesComponents,
+    Assets,
+    ConsoleCommands,
+    Migrations,
+    Behaviors,
+    Widgets,
+    ViewVars,
+    All,
+}
+
+lazy_static! {
+    static ref FILE_MTIMES: RwLock<FastMap<String, u64>> = RwLock::new(FastMap::default());
+    static ref CACHE_VERSION: RwLock<u64> = RwLock::new(0);
+}
+
+/// Increment cache version to invalidate all indexes.
+fn invalidate_all_caches() {
+    let mut v = CACHE_VERSION.write();
+    *v += 1;
+}
+
+/// Invalidate specific cache by updating file mtime.
+fn invalidate_file_cache(path: &str) {
+    let mut mtimes = FILE_MTIMES.write();
+    mtimes.insert(path.to_owned(), current_time_millis());
+}
+
+/// Get current time in milliseconds.
+fn current_time_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// Check if a file has been modified since last cache build.
+fn is_file_modified(path: &str, cached_mtime: u64) -> bool {
+    let mtimes = FILE_MTIMES.read();
+    mtimes.get(path).copied().unwrap_or(0) > cached_mtime
+}
+
+/// Get current cache version.
+fn get_cache_version() -> u64 {
+    *CACHE_VERSION.read()
 }
 
 impl OpBudget {
@@ -59,6 +120,162 @@ impl OpBudget {
     fn spent(&self) -> u32 {
         self.ops
     }
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/// Plugin settings loaded from settings.json
+#[derive(Debug, Clone)]
+pub struct PluginSettings {
+    pub view_path: String,
+    pub table_prefix: String,
+    pub report_missing_views: bool,
+    pub scan_paths: ScanPathsSettings,
+    pub features: FeatureSettings,
+    pub performance: PerformanceSettings,
+    pub advanced: AdvancedSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanPathsSettings {
+    pub controllers: Vec<String>,
+    pub models: Vec<String>,
+    pub views: Vec<String>,
+    pub messages: Vec<String>,
+    pub assets: Vec<String>,
+    pub widgets: Vec<String>,
+    pub commands: Vec<String>,
+    pub migrations: Vec<String>,
+    pub config: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeatureSettings {
+    pub views: bool,
+    pub routes: bool,
+    pub models: bool,
+    pub i18n: bool,
+    pub components: bool,
+    pub aliases: bool,
+    pub assets: bool,
+    pub console: bool,
+    pub migrations: bool,
+    pub behaviors: bool,
+    pub widgets: bool,
+    pub active_form_js: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PerformanceSettings {
+    pub max_scan_files: u32,
+    pub max_file_size_kb: usize,
+    pub max_completions: usize,
+    pub cache_ttl_seconds: u32,
+    pub enable_op_budget: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdvancedSettings {
+    pub project_type: ProjectType,
+    pub module_detection: bool,
+    pub url_manager_config_keys: Vec<String>,
+    pub custom_aliases: BTreeMap<String, String>,
+    pub ignored_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectType {
+    Basic,
+    Advanced,
+    Custom,
+}
+
+impl Default for ScanPathsSettings {
+    fn default() -> Self {
+        Self {
+            controllers: vec!["controllers".into(), "modules/*/controllers".into()],
+            models: vec!["models".into(), "modules/*/models".into(), "forms".into(), "modules/*/forms".into()],
+            views: vec!["views".into(), "modules/*/views".into()],
+            messages: vec!["messages".into(), "modules/*/messages".into()],
+            assets: vec!["assets".into(), "modules/*/assets".into()],
+            widgets: vec!["widgets".into(), "components".into(), "modules/*/widgets".into()],
+            commands: vec!["commands".into(), "modules/*/commands".into()],
+            migrations: vec!["migrations".into(), "modules/*/migrations".into(), "console/migrations".into()],
+            config: vec!["config".into(), "common/config".into(), "frontend/config".into(), "backend/config".into(), "console/config".into()],
+        }
+    }
+}
+
+impl Default for FeatureSettings {
+    fn default() -> Self {
+        Self {
+            views: true,
+            routes: true,
+            models: true,
+            i18n: true,
+            components: true,
+            aliases: true,
+            assets: true,
+            console: true,
+            migrations: true,
+            behaviors: true,
+            widgets: true,
+            active_form_js: true,
+        }
+    }
+}
+
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        Self {
+            max_scan_files: 25,
+            max_file_size_kb: 32,
+            max_completions: 32,
+            cache_ttl_seconds: 30,
+            enable_op_budget: true,
+        }
+    }
+}
+
+impl Default for AdvancedSettings {
+    fn default() -> Self {
+        Self {
+            project_type: ProjectType::Basic,
+            module_detection: true,
+            url_manager_config_keys: vec!["urlManager".into(), "components.urlManager".into()],
+            custom_aliases: BTreeMap::new(),
+            ignored_paths: vec!["vendor".into(), "runtime".into(), ".git".into(), "node_modules".into(), "tests/_output".into()],
+        }
+    }
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self {
+            view_path: "@app/views".into(),
+            table_prefix: "".into(),
+            report_missing_views: true,
+            scan_paths: ScanPathsSettings::default(),
+            features: FeatureSettings::default(),
+            performance: PerformanceSettings::default(),
+            advanced: AdvancedSettings::default(),
+        }
+    }
+}
+
+/// Load settings from the Invocation context.
+/// Returns default settings if the API is not available.
+fn load_settings(_ctx: &Invocation) -> PluginSettings {
+    // TODO: When openidea-plugin provides settings API, read from ctx.settings()
+    // For now, return defaults. The settings.json defines the schema for the IDE.
+    PluginSettings::default()
+}
+
+/// Load settings for a project (uses defaults for now, will read from IDE when API available).
+fn load_settings_for_project(_project: &Project) -> PluginSettings {
+    PluginSettings::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -425,25 +642,39 @@ fn resolve_view_path(
 
 /// Collect all view files under views/ for completion (optionally scoped).
 fn list_views(project: &Project) -> Vec<String> {
-    list_views_with_budget(project, None)
+    list_views_with_budget(project, None, None)
 }
 
-fn list_views_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> Vec<String> {
+fn list_views_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<String> {
     let mut out = BTreeSet::new();
     if budget.as_ref().map_or(false, |b| !b.check()) {
         return Vec::new();
     }
-    let Ok(files) = project.find_files("**/views/**/*.php", MAX_SCAN) else { return Vec::new() };
-    if budget.as_ref().map_or(false, |b| !b.check()) { return Vec::new(); }
-    if let Some(b) = budget.as_mut() { if !b.spend(2) { return Vec::new(); } }
-    for f in files {
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    // Use configurable view scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.views.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect())
+        .unwrap_or_else(|| vec!["**/views/**/*.php".into()]);
+    for pat in patterns {
         if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let norm = f.replace('\\', "/");
-        if let Some(idx) = norm.find("/views/") {
-            let rel = &norm[idx + 7..];
-            let name = rel.trim_end_matches(".php");
-            if !name.is_empty() {
-                out.insert(name.to_owned());
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
+        if budget.as_ref().map_or(false, |b| !b.check()) { return Vec::new(); }
+        if let Some(b) = budget.as_mut() { if !b.spend(2) { return Vec::new(); } }
+        for f in files {
+            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+            let norm = f.replace('\\', "/");
+            // Find the view path part after any of the configured view paths
+            for view_base in &settings.map(|s| s.scan_paths.views.clone()).unwrap_or_else(|| vec!["views".into()]) {
+                let view_base_norm = view_base.trim_end_matches('/').replace('\\', "/");
+                let search = format!("{}/", view_base_norm);
+                if let Some(idx) = norm.find(&search) {
+                    let rel = &norm[idx + search.len()..];
+                    let name = rel.trim_end_matches(".php");
+                    if !name.is_empty() {
+                        out.insert(name.to_owned());
+                    }
+                    break;
+                }
             }
         }
     }
@@ -816,7 +1047,7 @@ fn parse_model(path: &str, text: &str) -> Option<ModelInfo> {
         return None;
     }
 
-    let mut attrs = BTreeSet::new();
+    let mut attrs = FastSet::default();
 
     // public $foo;  /  public string $foo;
     for line in text.lines() {
@@ -863,7 +1094,7 @@ fn parse_model(path: &str, text: &str) -> Option<ModelInfo> {
 }
 
 /// Pull short string literals that look like attribute names out of a method body.
-fn extract_string_keys_from_method(text: &str, sig: &str, attrs: &mut BTreeSet<String>) {
+fn extract_string_keys_from_method(text: &str, sig: &str, attrs: &mut FastSet<String>) {
     let Some(i) = text.find(sig) else { return };
     let body = &text[i..];
     let mut depth = 0i32;
@@ -1048,11 +1279,11 @@ fn resolve_var_to_class(text: &str, var: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// category → set of message keys
-type MessageCatalog = BTreeMap<String, BTreeSet<String>>;
+type MessageCatalog = FastMap<String, FastSet<String>>;
 
 /// Parse a Yii message PHP file: return [ 'key' => 'translation', ... ]
-fn parse_message_file(text: &str) -> BTreeSet<String> {
-    let mut keys = BTreeSet::new();
+fn parse_message_file(text: &str) -> FastSet<String> {
+    let mut keys = FastSet::default();
     // Look for 'key' => or "key" => at array entries
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -1092,21 +1323,23 @@ fn parse_message_file(text: &str) -> BTreeSet<String> {
 /// Scan messages/ directories for categories and keys.
 /// Layout: messages/<lang>/<category>.php  or  messages/<category>.php
 fn scan_messages(project: &Project) -> MessageCatalog {
-    scan_messages_with_budget(project, None)
+    scan_messages_with_budget(project, None, None)
 }
 
-fn scan_messages_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> MessageCatalog {
-    let mut catalog: MessageCatalog = BTreeMap::new();
-    let patterns = [
-        "**/messages/**/*.php",
-    ];
-    let mut seen = BTreeSet::new();
+fn scan_messages_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> MessageCatalog {
+    let mut catalog: MessageCatalog = FastMap::default();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    // Use configurable message scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.messages.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect())
+        .unwrap_or_else(|| vec!["**/messages/**/*.php".into()]);
+    let mut seen = FastSet::default();
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
             if !seen.insert(path.clone()) {
                 continue;
             }
@@ -1676,6 +1909,19 @@ fn action_method_name(action: &str) -> String {
 }
 
 /// Heuristic params from action method: actionView($id, $slug = null) → [id, slug]
+/// Find the line number (0-indexed) of an action method in controller text.
+fn find_action_line(text: &str, action_method: &str) -> Option<u32> {
+    let needle = format!("function {action_method}");
+    let i = text.find(&needle).or_else(|| {
+        // public function actionView
+        text.find(&format!("function {action_method}("))
+    })?;
+    // Count newlines up to this position
+    let line = text[..i].matches('\n').count() as u32;
+    Some(line)
+}
+
+/// Heuristic params from action method: actionView($id, $slug = null) → [id, slug]
 fn action_params_from_controller_text(text: &str, action_method: &str) -> Vec<String> {
     let needle = format!("function {action_method}");
     let Some(i) = text.find(&needle).or_else(|| {
@@ -1710,7 +1956,7 @@ fn action_params_from_controller_text(text: &str, action_method: &str) -> Vec<St
 }
 
 /// Build route catalog from controller index.
-fn routes_from_controllers(controllers: &BTreeMap<String, ControllerInfo>) -> Vec<RouteInfo> {
+fn routes_from_controllers(controllers: &FastMap<String, ControllerInfo>) -> Vec<RouteInfo> {
     let mut routes = Vec::new();
     for c in controllers.values() {
         let base = match &c.module {
@@ -1822,22 +2068,28 @@ fn parse_url_rules(text: &str) -> Vec<UrlRule> {
 }
 
 fn scan_url_rules(project: &Project) -> Vec<UrlRule> {
-    scan_url_rules_with_budget(project, None)
+    scan_url_rules_with_budget(project, None, None)
 }
 
-fn scan_url_rules_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> Vec<UrlRule> {
+fn scan_url_rules_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<UrlRule> {
     let mut rules = Vec::new();
-    for pat in [
-        "**/config/main.php",
-        "**/config/web.php",
-        "**/config/console.php",
-        "**/common/config/main.php",
-        "**/frontend/config/main.php",
-        "**/backend/config/main.php",
-        "**/console/config/main.php",
-    ] {
+    let _max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    let max_config_files = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_CONFIG_FILES);
+    // Use configurable config scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.config.clone())
+        .unwrap_or_else(|| vec![
+            "**/config/main.php".into(),
+            "**/config/web.php".into(),
+            "**/config/console.php".into(),
+            "**/common/config/main.php".into(),
+            "**/frontend/config/main.php".into(),
+            "**/backend/config/main.php".into(),
+            "**/console/config/main.php".into(),
+        ]);
+    for pat in patterns {
         if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, 30) else { continue };
+        let Ok(files) = project.find_files(&pat, max_config_files) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
             if budget.as_ref().map_or(false, |b| !b.check()) { break; }
@@ -1886,13 +2138,27 @@ fn params_for_route(route: &str, rules: &[UrlRule]) -> Vec<String> {
 }
 
 /// Resolve route string (or pretty URL) to controller file (+ action + params).
+/// Supports:
+/// - Internal routes: `site/index`, `module/controller/action`
+/// - Absolute routes: `/site/index`, `/module/controller/action` (leading / = from app root)
+/// - REST patterns: `['POST', 'post/create']`, `['GET', 'post/<id>']`
 fn resolve_route(
     route: &str,
-    controllers: &BTreeMap<String, ControllerInfo>,
+    controllers: &FastMap<String, ControllerInfo>,
     url_rules: &[UrlRule],
 ) -> Option<RouteInfo> {
-    let mut r = route.trim().trim_start_matches('/').to_owned();
+    let route = route.trim();
+    if route.is_empty() {
+        return None;
+    }
+
+    // Check if it's a REST pattern: ['HTTP_METHOD', 'route']
+    let rest_route = extract_rest_route(route);
+    let (route_to_resolve, _http_method) = rest_route.unwrap_or((route.to_owned(), None));
+
+    let mut r = route_to_resolve.trim().trim_start_matches('/').to_owned();
     let mut from_rule_params = Vec::new();
+    let is_absolute = route_to_resolve.starts_with('/');
 
     // 1) exact pattern match or parameterized pattern match
     for rule in url_rules {
@@ -1915,17 +2181,28 @@ fn resolve_route(
     if parts.is_empty() {
         return None;
     }
-    let candidates = match parts.len() {
-        1 => vec![parts[0].to_owned()],
-        2 => vec![
+
+    // For absolute routes (/module/controller/action), try to match module/controller first
+    let candidates = if is_absolute && parts.len() >= 2 {
+        // Try module/controller/action first, then controller/action
+        vec![
             format!("{}/{}", parts[0], parts[1]),
+            if parts.len() >= 3 { format!("{}/{}/{}", parts[0], parts[1], parts[2]) } else { String::new() },
             parts[0].to_owned(),
-        ],
-        _ => vec![
-            format!("{}/{}", parts[0], parts[1]),
-            parts[0].to_owned(),
-            parts[..parts.len() - 1].join("/"),
-        ],
+        ].into_iter().filter(|s| !s.is_empty()).collect()
+    } else {
+        match parts.len() {
+            1 => vec![parts[0].to_owned()],
+            2 => vec![
+                format!("{}/{}", parts[0], parts[1]),
+                parts[0].to_owned(),
+            ],
+            _ => vec![
+                format!("{}/{}", parts[0], parts[1]),
+                parts[0].to_owned(),
+                parts[..parts.len() - 1].join("/"),
+            ],
+        }
     };
     for key in candidates {
         if let Some(c) = controllers.get(&key) {
@@ -1962,6 +2239,48 @@ fn resolve_route(
         }
     }
     None
+}
+
+/// Extract REST route from patterns like `['POST', 'post/create']` or `['GET', 'post/<id>']`
+fn extract_rest_route(route: &str) -> Option<(String, Option<String>)> {
+    // Look for ['METHOD', 'route'] pattern
+    let bytes = route.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'[' {
+        return None;
+    }
+    let mut i = 1;
+    // Skip whitespace
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Check for quote
+    let q = bytes.get(i)?;
+    if !matches!(q, b'\'' | b'"') {
+        return None;
+    }
+    i += 1;
+    let method_start = i;
+    while i < bytes.len() && bytes[i] != *q {
+        i += 1;
+    }
+    let method = route[method_start..i].to_uppercase();
+    i += 1; // closing quote
+    // Skip whitespace and comma
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+        i += 1;
+    }
+    // Check for second quote
+    let q2 = bytes.get(i)?;
+    if !matches!(q2, b'\'' | b'"') {
+        return None;
+    }
+    i += 1;
+    let route_start = i;
+    while i < bytes.len() && bytes[i] != *q2 {
+        i += 1;
+    }
+    let rest_route = route[route_start..i].to_owned();
+    Some((rest_route, Some(method)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2395,10 +2714,10 @@ fn resolve_class_file(project: &Project, class: &str) -> Option<String> {
 
 /// Scan Yii config files for aliases and components.
 fn scan_config_aliases_components(project: &Project) -> (Vec<AliasInfo>, Vec<ComponentInfo>) {
-    scan_config_aliases_components_with_budget(project, None)
+    scan_config_aliases_components_with_budget(project, None, None)
 }
 
-fn scan_config_aliases_components_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> (Vec<AliasInfo>, Vec<ComponentInfo>) {
+fn scan_config_aliases_components_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> (Vec<AliasInfo>, Vec<ComponentInfo>) {
     let mut aliases = Vec::new();
     for (n, p) in [
         ("@app", ""),
@@ -2416,36 +2735,48 @@ fn scan_config_aliases_components_with_budget(project: &Project, mut budget: Opt
     ] {
         aliases.push(AliasInfo { name: n.into(), path: p.into() });
     }
+    // Add custom aliases from settings
+    if let Some(s) = settings {
+        for (name, path) in &s.advanced.custom_aliases {
+            aliases.push(AliasInfo { name: name.clone(), path: path.clone() });
+        }
+    }
 
-    let mut by_id: BTreeMap<String, ComponentInfo> = BTreeMap::new();
+    let mut by_id: FastMap<String, ComponentInfo> = FastMap::default();
     for c in builtin_components() {
         by_id.insert(c.id.clone(), c);
     }
 
     // Prefer real app configs; avoid scanning every PHP under config/.
-    let patterns = [
-        "**/config/main.php",
-        "**/config/web.php",
-        "**/config/console.php",
-        "**/config/main-local.php",
-        "**/config/web-local.php",
-        "**/common/config/main.php",
-        "**/common/config/main-local.php",
-        "**/frontend/config/main.php",
-        "**/backend/config/main.php",
-        "**/console/config/main.php",
-    ];
-    let mut seen = BTreeSet::new();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    let max_config_files = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_CONFIG_FILES);
+    // Use configurable config scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.config.clone())
+        .unwrap_or_else(|| vec![
+            "**/config/main.php".into(),
+            "**/config/web.php".into(),
+            "**/config/console.php".into(),
+            "**/config/main-local.php".into(),
+            "**/config/web-local.php".into(),
+            "**/common/config/main.php".into(),
+            "**/common/config/main-local.php".into(),
+            "**/frontend/config/main.php".into(),
+            "**/backend/config/main.php".into(),
+            "**/console/config/main.php".into(),
+        ]);
+    let mut seen = FastSet::default();
+    let max_config_files_usize = max_config_files as usize;
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        if seen.len() >= MAX_CONFIG_FILES {
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        if seen.len() >= max_config_files_usize {
             break;
         }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-            if seen.len() >= MAX_CONFIG_FILES {
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+            if seen.len() >= max_config_files_usize {
                 break;
             }
             if !seen.insert(path.clone()) {
@@ -2489,7 +2820,7 @@ fn scan_config_aliases_components_with_budget(project: &Project, mut budget: Opt
     // Class-file resolution is deferred to Go-to-Definition.
     let components: Vec<ComponentInfo> = by_id.into_values().collect();
 
-    let mut amap = BTreeMap::new();
+    let mut amap = FastMap::default();
     for a in aliases {
         amap.entry(a.name.clone()).or_insert(a);
     }
@@ -2645,29 +2976,32 @@ fn parse_asset_bundle(path: &str, text: &str) -> Option<AssetInfo> {
     })
 }
 
-fn list_assets(project: &Project) -> BTreeMap<String, AssetInfo> {
-    list_assets_with_budget(project, None)
+fn list_assets(project: &Project) -> FastMap<String, AssetInfo> {
+    list_assets_with_budget(project, None, None)
 }
 
-fn list_assets_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> BTreeMap<String, AssetInfo> {
-    let mut map = BTreeMap::new();
-    let patterns = [
-        "**/assets/**/*Asset.php",
-        "**/Assets/**/*Asset.php",
-    ];
-    let mut seen = BTreeSet::new();
+fn list_assets_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> FastMap<String, AssetInfo> {
+    let mut map = FastMap::default();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    let max_asset_scan = settings.map(|s| s.performance.max_scan_files.min(15)).unwrap_or(MAX_ASSET_SCAN);
+    let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
+    // Use configurable asset scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.assets.iter().map(|p| format!("{}/**/*Asset.php", p.trim_end_matches('/'))).collect())
+        .unwrap_or_else(|| vec!["**/assets/**/*Asset.php".into(), "**/Assets/**/*Asset.php".into()]);
+    let mut seen = FastSet::default();
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-            if seen.len() as u32 >= MAX_ASSET_SCAN {
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+            if seen.len() >= max_asset_scan as usize {
                 break;
             }
             if !seen.insert(path.clone()) { continue; }
             let Ok(text) = project.read_file(&path) else { continue };
-            if file_too_big(text.len()) { continue; }
+            if text.len() > max_file_size { continue; }
             if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
             if let Some(info) = parse_asset_bundle(&path, &text) {
                 map.insert(info.class.clone(), info);
@@ -2961,27 +3295,32 @@ fn parse_console_command(path: &str, text: &str) -> Option<ConsoleCommandInfo> {
 }
 
 fn list_console_commands(project: &Project) -> Vec<ConsoleCommandInfo> {
-    list_console_commands_with_budget(project, None)
+    list_console_commands_with_budget(project, None, None)
 }
 
-fn list_console_commands_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> Vec<ConsoleCommandInfo> {
+fn list_console_commands_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<ConsoleCommandInfo> {
     let mut out = Vec::new();
-    let patterns = [
-        "**/commands/**/*Controller.php",
-        "**/console/controllers/**/*Controller.php",
-        "**/console/commands/**/*Controller.php",
-    ];
-    let mut seen = BTreeSet::new();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
+    // Use configurable command scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.commands.iter().map(|p| format!("{}/**/*Controller.php", p.trim_end_matches('/'))).collect())
+        .unwrap_or_else(|| vec![
+            "**/commands/**/*Controller.php".into(),
+            "**/console/controllers/**/*Controller.php".into(),
+            "**/console/commands/**/*Controller.php".into(),
+        ]);
+    let mut seen = FastSet::default();
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-            if out.len() as u32 >= MAX_SCAN { return out; }
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+            if out.len() >= max_scan as usize { return out; }
             if !seen.insert(path.clone()) { continue; }
             let Ok(text) = project.read_file(&path) else { continue };
-            if file_too_big(text.len()) { continue; }
+            if text.len() > max_file_size { continue; }
             if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
             if let Some(info) = parse_console_command(&path, &text) {
                 out.push(info);
@@ -2992,23 +3331,27 @@ fn list_console_commands_with_budget(project: &Project, mut budget: Option<&mut 
 }
 
 fn list_migrations(project: &Project) -> Vec<MigrationInfo> {
-    list_migrations_with_budget(project, None)
+    list_migrations_with_budget(project, None, None)
 }
 
-fn list_migrations_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> Vec<MigrationInfo> {
+fn list_migrations_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<MigrationInfo> {
     let mut out = Vec::new();
-    let patterns = [
-        "**/migrations/m*.php",
-        "**/Migrations/m*.php",
-        "**/console/migrations/m*.php",
-    ];
-    let mut seen = BTreeSet::new();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    // Use configurable migration scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.migrations.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect())
+        .unwrap_or_else(|| vec![
+            "**/migrations/m*.php".into(),
+            "**/Migrations/m*.php".into(),
+            "**/console/migrations/m*.php".into(),
+        ]);
+    let mut seen = FastSet::default();
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
             if !seen.insert(path.clone()) { continue; }
             let name = path.rsplit('/').next().unwrap_or(&path).trim_end_matches(".php").to_owned();
             out.push(MigrationInfo { name, path });
@@ -3040,22 +3383,27 @@ fn parse_behavior_or_widget(path: &str, text: &str, kind: &str) -> Option<(Strin
 }
 
 fn list_behaviors(project: &Project) -> Vec<BehaviorInfo> {
-    list_behaviors_with_budget(project, None)
+    list_behaviors_with_budget(project, None, None)
 }
 
-fn list_behaviors_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> Vec<BehaviorInfo> {
+fn list_behaviors_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<BehaviorInfo> {
     let mut out = Vec::new();
-    let patterns = ["**/behaviors/**/*.php", "**/*Behavior.php"];
-    let mut seen = BTreeSet::new();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
+    // Use configurable behaviors scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.widgets.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect()) // behaviors don't have separate config, use widgets
+        .unwrap_or_else(|| vec!["**/behaviors/**/*.php".into(), "**/*Behavior.php".into()]);
+    let mut seen = FastSet::default();
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
             if !seen.insert(path.clone()) { continue; }
             let Ok(text) = project.read_file(&path) else { continue };
-            if file_too_big(text.len()) { continue; }
+            if text.len() > max_file_size { continue; }
             if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
             if let Some((class, p)) = parse_behavior_or_widget(&path, &text, "behavior") {
                 out.push(BehaviorInfo { class, path: p });
@@ -3066,22 +3414,27 @@ fn list_behaviors_with_budget(project: &Project, mut budget: Option<&mut OpBudge
 }
 
 fn list_widgets(project: &Project) -> Vec<WidgetInfo> {
-    list_widgets_with_budget(project, None)
+    list_widgets_with_budget(project, None, None)
 }
 
-fn list_widgets_with_budget(project: &Project, mut budget: Option<&mut OpBudget>) -> Vec<WidgetInfo> {
+fn list_widgets_with_budget(project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<WidgetInfo> {
     let mut out = Vec::new();
-    let patterns = ["**/widgets/**/*.php", "**/*Widget.php"];
-    let mut seen = BTreeSet::new();
+    let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+    let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
+    // Use configurable widget scan paths
+    let patterns: Vec<String> = settings
+        .map(|s| s.scan_paths.widgets.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect())
+        .unwrap_or_else(|| vec!["**/widgets/**/*.php".into(), "**/*Widget.php".into()]);
+    let mut seen = FastSet::default();
     for pat in patterns {
-        if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-        let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
+        if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+        let Ok(files) = project.find_files(&pat, max_scan) else { continue };
         if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
         for path in files {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
             if !seen.insert(path.clone()) { continue; }
             let Ok(text) = project.read_file(&path) else { continue };
-            if file_too_big(text.len()) { continue; }
+            if text.len() > max_file_size { continue; }
             if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
             if let Some((class, p)) = parse_behavior_or_widget(&path, &text, "widget") {
                 out.push(WidgetInfo { class, path: p });
@@ -3544,66 +3897,71 @@ fn is_js_lang(lang: &str) -> bool {
 #[derive(Default)]
 pub struct Yii2Support {
     /// Cheap to clone (Arc); avoid deep-copying indexes on every completion.
-    views_cache: BTreeMap<String, Arc<Vec<String>>>,
-    models_cache: BTreeMap<String, Arc<BTreeMap<String, ModelInfo>>>,
-    controllers_cache: BTreeMap<String, Arc<BTreeMap<String, ControllerInfo>>>,
-    messages_cache: BTreeMap<String, Arc<MessageCatalog>>,
-    url_rules_cache: BTreeMap<String, Arc<Vec<UrlRule>>>,
-    aliases_cache: BTreeMap<String, Arc<Vec<AliasInfo>>>,
-    components_cache: BTreeMap<String, Arc<Vec<ComponentInfo>>>,
-    assets_cache: BTreeMap<String, Arc<BTreeMap<String, AssetInfo>>>,
-    console_cache: BTreeMap<String, Arc<Vec<ConsoleCommandInfo>>>,
-    migrations_cache: BTreeMap<String, Arc<Vec<MigrationInfo>>>,
-    behaviors_cache: BTreeMap<String, Arc<Vec<BehaviorInfo>>>,
-    widgets_cache: BTreeMap<String, Arc<Vec<WidgetInfo>>>,
+    views_cache: FastMap<String, (u64, Arc<Vec<String>>)>,
+    models_cache: FastMap<String, (u64, Arc<FastMap<String, ModelInfo>>)>,
+    controllers_cache: FastMap<String, (u64, Arc<FastMap<String, ControllerInfo>>)>,
+    messages_cache: FastMap<String, (u64, Arc<MessageCatalog>)>,
+    url_rules_cache: FastMap<String, (u64, Arc<Vec<UrlRule>>)>,
+    aliases_cache: FastMap<String, (u64, Arc<Vec<AliasInfo>>)>,
+    components_cache: FastMap<String, (u64, Arc<Vec<ComponentInfo>>)>,
+    assets_cache: FastMap<String, (u64, Arc<FastMap<String, AssetInfo>>)>,
+    console_cache: FastMap<String, (u64, Arc<Vec<ConsoleCommandInfo>>)>,
+    migrations_cache: FastMap<String, (u64, Arc<Vec<MigrationInfo>>)>,
+    behaviors_cache: FastMap<String, (u64, Arc<Vec<BehaviorInfo>>)>,
+    widgets_cache: FastMap<String, (u64, Arc<Vec<WidgetInfo>>)>,
     /// view key → variables passed via render(..., [keys])
-    view_vars_cache: BTreeMap<String, Arc<BTreeMap<String, Vec<ViewVarInfo>>>>,
+    view_vars_cache: FastMap<String, (u64, Arc<FastMap<String, Vec<ViewVarInfo>>>)>,
     /// Track if first request has been processed; on first request skip all project scans
     /// to avoid timeout, only return local completions.
     initial_scan_done: bool,
 }
 
 impl Yii2Support {
-    fn views(&mut self, project: &Project) -> Arc<Vec<String>> {
-        self.views_with_budget(project, None)
+    fn views(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<Vec<String>> {
+        self.views_with_budget(project, None, settings)
     }
 
-    fn views_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<String>> {
+    fn views_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<String>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.views_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.views_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
-        if budget.as_ref().map_or(false, |b| !b.check()) {
-            return Arc::new(Vec::new());
-        }
-        let list = Arc::new(list_views_with_budget(project, budget));
-        self.views_cache.insert(root, Arc::clone(&list));
+        // Inline budget check to avoid Option allocation
+        if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(Vec::new()); } }
+        let list = Arc::new(list_views_with_budget(project, budget, settings));
+        self.views_cache.insert(root, (current_version, Arc::clone(&list)));
         list
     }
 
-    fn controllers(&mut self, project: &Project) -> Arc<BTreeMap<String, ControllerInfo>> {
-        self.controllers_with_budget(project, None)
+    fn controllers(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<FastMap<String, ControllerInfo>> {
+        self.controllers_with_budget(project, None, settings)
     }
 
-    fn controllers_with_budget(&mut self, project: &Project, mut budget: Option<&mut OpBudget>) -> Arc<BTreeMap<String, ControllerInfo>> {
+    fn controllers_with_budget(&mut self, project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<FastMap<String, ControllerInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(map) = self.controllers_cache.get(&root) {
-            return Arc::clone(map);
+        let current_version = get_cache_version();
+        if let Some((version, map)) = self.controllers_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(map);
+            }
         }
-        if budget.as_ref().map_or(false, |b| !b.check()) {
-            return Arc::new(BTreeMap::new());
-        }
-        let mut map = BTreeMap::new();
-        let mut vmap: BTreeMap<String, Vec<ViewVarInfo>> = BTreeMap::new();
-        // Prefer narrow globs; fall back only if empty.
-        let patterns: &[&str] = &[
-            "**/controllers/**/*Controller.php",
-            "**/console/controllers/**/*Controller.php",
-            "**/modules/**/controllers/**/*Controller.php",
-        ];
-        let mut seen = BTreeSet::new();
+        // Inline budget check to avoid Option allocation
+        if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
+        let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+        let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
+        let mut map = FastMap::default();
+        let mut vmap: FastMap<String, Vec<ViewVarInfo>> = FastMap::default();
+        // Use configurable scan paths
+        let patterns: Vec<String> = settings
+            .map(|s| s.scan_paths.controllers.clone())
+            .unwrap_or_else(|| vec!["**/controllers/**/*Controller.php".into(), "**/console/controllers/**/*Controller.php".into(), "**/modules/**/controllers/**/*Controller.php".into()]);
+        let patterns_ref: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+        let mut seen = FastSet::default();
         let mut ingested = 0u32;
-        let ingest = |path: String, text: String, map: &mut BTreeMap<String, ControllerInfo>, vmap: &mut BTreeMap<String, Vec<ViewVarInfo>>| {
+        let ingest = |path: String, text: String, map: &mut FastMap<String, ControllerInfo>, vmap: &mut FastMap<String, Vec<ViewVarInfo>>| {
             if let Some(info) = parse_controller(&path, &text) {
                 for (view_lit, vars) in extract_render_calls(&text) {
                     for key in render_view_keys(&view_lit, &info) {
@@ -3622,21 +3980,21 @@ impl Yii2Support {
                 map.insert(key, info);
             }
         };
-        for pat in patterns {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-            let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+        for pat in &patterns_ref {
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+            let Ok(files) = project.find_files(pat, max_scan) else { continue };
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
             if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
             for path in files {
-                if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-                if seen.len() as u32 >= MAX_SCAN {
+                if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+                if seen.len() >= max_scan as usize {
                     break;
                 }
                 if !seen.insert(path.clone()) {
                     continue;
                 }
                 let Ok(text) = project.read_file(&path) else { continue };
-                if file_too_big(text.len()) {
+                if text.len() > max_file_size {
                     continue;
                 }
                 if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
@@ -3644,23 +4002,34 @@ impl Yii2Support {
                 ingested += 1;
                 if ingested >= 30 { break; } // Hard cap on files parsed
             }
-            if seen.len() as u32 >= MAX_SCAN {
+            if seen.len() >= max_scan as usize {
                 break;
             }
         }
-        if map.is_empty() && budget.as_ref().map_or(true, |b| b.check()) {
-            if let Ok(files) = project.find_files("**/*Controller.php", MAX_SCAN / 2) {
-                if let Some(b) = budget.as_mut() { if !b.spend(2) { return Arc::new(map); } }
+        if map.is_empty() {
+            if let Some(b) = budget.as_ref() { if !b.check() {
+                self.view_vars_cache.insert(root.clone(), (current_version, Arc::new(vmap)));
+                let map = Arc::new(map);
+                self.controllers_cache.insert(root, (current_version, Arc::clone(&map)));
+                return map;
+            } }
+            if let Ok(files) = project.find_files("**/*Controller.php", max_scan / 2) {
+                if let Some(b) = budget.as_mut() { if !b.spend(2) {
+                    self.view_vars_cache.insert(root.clone(), (current_version, Arc::new(vmap)));
+                    let map = Arc::new(map);
+                    self.controllers_cache.insert(root, (current_version, Arc::clone(&map)));
+                    return map;
+                } }
                 for path in files {
-                    if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-                    if seen.len() as u32 >= MAX_SCAN {
+                    if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+                    if seen.len() >= max_scan as usize {
                         break;
                     }
                     if !seen.insert(path.clone()) {
                         continue;
                     }
                     let Ok(text) = project.read_file(&path) else { continue };
-                    if file_too_big(text.len()) {
+                    if text.len() > max_file_size {
                         continue;
                     }
                     if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
@@ -3670,65 +4039,70 @@ impl Yii2Support {
                 }
             }
         }
-        self.view_vars_cache.insert(root.clone(), Arc::new(vmap));
+        self.view_vars_cache.insert(root.clone(), (current_version, Arc::new(vmap)));
         let map = Arc::new(map);
-        self.controllers_cache.insert(root, Arc::clone(&map));
+        self.controllers_cache.insert(root, (current_version, Arc::clone(&map)));
         map
     }
 
 
-    fn view_vars(&mut self, project: &Project) -> Arc<BTreeMap<String, Vec<ViewVarInfo>>> {
+    fn view_vars(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<FastMap<String, Vec<ViewVarInfo>>> {
         let root = project.root().unwrap_or_default();
-        if let Some(m) = self.view_vars_cache.get(&root) {
-            return Arc::clone(m);
+        let current_version = get_cache_version();
+        if let Some((version, m)) = self.view_vars_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(m);
+            }
         }
         // Ensure controllers() built the index.
-        let _ = self.controllers(project);
+        let _ = self.controllers(project, settings);
         self.view_vars_cache
             .get(&root)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(BTreeMap::new()))
+            .map(|(_, m)| Arc::clone(m))
+            .unwrap_or_else(|| Arc::new(FastMap::default()))
     }
 
     fn messages(&mut self, project: &Project) -> Arc<MessageCatalog> {
-        self.messages_with_budget(project, None)
+        self.messages_with_budget(project, None, None)
     }
 
-    fn messages_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<MessageCatalog> {
+    fn messages_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<MessageCatalog> {
         let root = project.root().unwrap_or_default();
-        if let Some(cat) = self.messages_cache.get(&root) {
-            return Arc::clone(cat);
+        let current_version = get_cache_version();
+        if let Some((version, cat)) = self.messages_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(cat);
+            }
         }
-        if budget.as_ref().map_or(false, |b| !b.check()) {
-            return Arc::new(BTreeMap::new());
-        }
-        let cat = Arc::new(scan_messages_with_budget(project, budget));
-        self.messages_cache.insert(root, Arc::clone(&cat));
+        if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
+        let cat = Arc::new(scan_messages_with_budget(project, budget, settings));
+        self.messages_cache.insert(root, (current_version, Arc::clone(&cat)));
         cat
     }
 
     fn url_rules(&mut self, project: &Project) -> Arc<Vec<UrlRule>> {
-        self.url_rules_with_budget(project, None)
+        self.url_rules_with_budget(project, None, None)
     }
 
-    fn url_rules_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<UrlRule>> {
+    fn url_rules_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<UrlRule>> {
         let root = project.root().unwrap_or_default();
-        if let Some(rules) = self.url_rules_cache.get(&root) {
-            return Arc::clone(rules);
+        let current_version = get_cache_version();
+        if let Some((version, rules)) = self.url_rules_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(rules);
+            }
         }
-        if budget.as_ref().map_or(false, |b| !b.check()) {
-            return Arc::new(Vec::new());
-        }
-        let rules = Arc::new(scan_url_rules_with_budget(project, budget));
-        self.url_rules_cache.insert(root, Arc::clone(&rules));
+        if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(Vec::new()); } }
+        let rules = Arc::new(scan_url_rules_with_budget(project, budget, settings));
+        self.url_rules_cache.insert(root, (current_version, Arc::clone(&rules)));
         rules
     }
 
     /// Enrich routes with params from rules + optional action signature from controller file.
     fn routes_with_params(&mut self, project: &Project) -> Vec<RouteInfo> {
         let mut budget = OpBudget::new();
-        let mut routes = self.all_routes_with_budget(project, Some(&mut budget));
-        let rules = self.url_rules_with_budget(project, Some(&mut budget));
+        let mut routes = self.all_routes_with_budget(project, Some(&mut budget), None);
+        let rules = self.url_rules_with_budget(project, Some(&mut budget), None);
         // Cap enrichment: reading every controller is expensive.
         let mut reads = 0u32;
         const MAX_ACTION_READS: u32 = 12; // Reduced from 24
@@ -3759,50 +4133,52 @@ impl Yii2Support {
     }
 
     fn all_routes(&mut self, project: &Project) -> Vec<RouteInfo> {
-        self.all_routes_with_budget(project, None)
+        self.all_routes_with_budget(project, None, None)
     }
 
-    fn all_routes_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Vec<RouteInfo> {
-        let ctrls = self.controllers_with_budget(project, budget);
+    fn all_routes_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Vec<RouteInfo> {
+        let ctrls = self.controllers_with_budget(project, budget, settings);
         routes_from_controllers(&ctrls)
     }
 
     /// Build or return cached model index for the project.
-    fn models(&mut self, project: &Project) -> Arc<BTreeMap<String, ModelInfo>> {
-        self.models_with_budget(project, None)
+    fn models(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<FastMap<String, ModelInfo>> {
+        self.models_with_budget(project, None, settings)
     }
 
-    fn models_with_budget(&mut self, project: &Project, mut budget: Option<&mut OpBudget>) -> Arc<BTreeMap<String, ModelInfo>> {
+    fn models_with_budget(&mut self, project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<FastMap<String, ModelInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(map) = self.models_cache.get(&root) {
-            return Arc::clone(map);
+        let current_version = get_cache_version();
+        if let Some((version, map)) = self.models_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(map);
+            }
         }
-        if budget.as_ref().map_or(false, |b| !b.check()) {
-            return Arc::new(BTreeMap::new());
-        }
-        let mut map = BTreeMap::new();
-        let patterns = [
-            "**/models/**/*.php",
-            "**/forms/**/*.php",
-            "**/common/models/**/*.php",
-        ];
-        let mut seen = BTreeSet::new();
+        if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
+        let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
+        let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
+        let mut map = FastMap::default();
+        // Use configurable model scan paths
+        let patterns: Vec<String> = settings
+            .map(|s| s.scan_paths.models.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect())
+            .unwrap_or_else(|| vec!["**/models/**/*.php".into(), "**/forms/**/*.php".into(), "**/common/models/**/*.php".into()]);
+        let mut seen = FastSet::default();
         let mut ingested = 0u32;
         for pat in patterns {
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-            let Ok(files) = project.find_files(pat, MAX_SCAN) else { continue };
-            if budget.as_ref().map_or(false, |b| !b.check()) { break; }
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+            let Ok(files) = project.find_files(&pat, max_scan) else { continue };
+            if let Some(b) = budget.as_ref() { if !b.check() { break; } }
             if let Some(b) = budget.as_mut() { if !b.spend(2) { break; } }
             for path in files {
-                if budget.as_ref().map_or(false, |b| !b.check()) { break; }
-                if seen.len() as u32 >= MAX_SCAN {
+                if let Some(b) = budget.as_ref() { if !b.check() { break; } }
+                if seen.len() >= max_scan as usize {
                     break;
                 }
                 if !seen.insert(path.clone()) {
                     continue;
                 }
                 let Ok(text) = project.read_file(&path) else { continue };
-                if file_too_big(text.len()) {
+                if text.len() > max_file_size {
                     continue;
                 }
                 if let Some(b) = budget.as_mut() { if !b.spend(1) { break; } }
@@ -3812,16 +4188,17 @@ impl Yii2Support {
                 ingested += 1;
                 if ingested >= 25 { break; }
             }
-            if seen.len() as u32 >= MAX_SCAN {
+            if seen.len() >= max_scan as usize {
                 break;
             }
         }
         let map = Arc::new(map);
-        self.models_cache.insert(root, Arc::clone(&map));
+        let current_version = get_cache_version();
+        self.models_cache.insert(root, (current_version, Arc::clone(&map)));
         map
     }
 
-    fn ctx_for_doc(&mut self, project: &Project, path: &str, text: &str) -> Option<ControllerInfo> {
+    fn ctx_for_doc(&mut self, project: &Project, path: &str, text: &str, settings: Option<&PluginSettings>) -> Option<ControllerInfo> {
         if let Some(c) = controller_context_from_path(path, text) {
             return Some(c);
         }
@@ -3829,7 +4206,7 @@ impl Yii2Support {
         if let Some(info) = parse_controller(path, text) {
             return Some(info);
         }
-        let _ = self.controllers_with_budget(project, None);
+        let _ = self.controllers_with_budget(project, None, settings);
         None
     }
 
@@ -3841,7 +4218,7 @@ impl Yii2Support {
         var: &str,
     ) -> Vec<(String /*attr*/, String /*source class*/)> {
         let mut budget = OpBudget::new();
-        let models = self.models_with_budget(project, Some(&mut budget));
+        let models = self.models_with_budget(project, Some(&mut budget), None);
         let mut out = Vec::new();
 
         // 1. Resolve $var → ClassName from local type info
@@ -3887,134 +4264,186 @@ impl Yii2Support {
 
 
     fn aliases(&mut self, project: &Project) -> Arc<Vec<AliasInfo>> {
-        self.aliases_with_budget(project, None)
+        self.aliases_with_budget(project, None, None)
     }
 
-    fn aliases_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<AliasInfo>> {
+    fn aliases_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<AliasInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.aliases_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.aliases_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
-        let (aliases, components) = scan_config_aliases_components_with_budget(project, budget);
+        let (aliases, components) = scan_config_aliases_components_with_budget(project, budget, settings);
         let aliases = Arc::new(aliases);
         let components = Arc::new(components);
-        self.components_cache.insert(root.clone(), Arc::clone(&components));
-        self.aliases_cache.insert(root, Arc::clone(&aliases));
+        self.components_cache.insert(root.clone(), (current_version, Arc::clone(&components)));
+        self.aliases_cache.insert(root, (current_version, Arc::clone(&aliases)));
         aliases
     }
 
     fn components(&mut self, project: &Project) -> Arc<Vec<ComponentInfo>> {
-        self.components_with_budget(project, None)
+        self.components_with_budget(project, None, None)
     }
 
-    fn components_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<ComponentInfo>> {
+    fn components_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<ComponentInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.components_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.components_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
-        let (aliases, components) = scan_config_aliases_components_with_budget(project, budget);
+        let (aliases, components) = scan_config_aliases_components_with_budget(project, budget, settings);
         let aliases = Arc::new(aliases);
         let components = Arc::new(components);
-        self.aliases_cache.insert(root.clone(), aliases);
-        self.components_cache.insert(root, Arc::clone(&components));
+        self.aliases_cache.insert(root.clone(), (current_version, aliases));
+        self.components_cache.insert(root, (current_version, Arc::clone(&components)));
         components
     }
 
-    fn assets(&mut self, project: &Project) -> Arc<BTreeMap<String, AssetInfo>> {
-        self.assets_with_budget(project, None)
+    fn assets(&mut self, project: &Project) -> Arc<FastMap<String, AssetInfo>> {
+        self.assets_with_budget(project, None, None)
     }
 
-    fn assets_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<BTreeMap<String, AssetInfo>> {
+    fn assets_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<FastMap<String, AssetInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(map) = self.assets_cache.get(&root) {
-            return Arc::clone(map);
+        let current_version = get_cache_version();
+        if let Some((version, map)) = self.assets_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(map);
+            }
         }
-        if budget.as_ref().map_or(false, |b| !b.check()) {
-            return Arc::new(BTreeMap::new());
-        }
-        let map = Arc::new(list_assets_with_budget(project, budget));
-        self.assets_cache.insert(root, Arc::clone(&map));
+        if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
+        let map = Arc::new(list_assets_with_budget(project, budget, settings));
+        self.assets_cache.insert(root, (current_version, Arc::clone(&map)));
         map
     }
 
     fn console_commands(&mut self, project: &Project) -> Arc<Vec<ConsoleCommandInfo>> {
-        self.console_commands_with_budget(project, None)
+        self.console_commands_with_budget(project, None, None)
     }
 
-    fn console_commands_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<ConsoleCommandInfo>> {
+    fn console_commands_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<ConsoleCommandInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.console_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.console_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
-        let list = Arc::new(list_console_commands_with_budget(project, budget));
-        self.console_cache.insert(root, Arc::clone(&list));
+        let list = Arc::new(list_console_commands_with_budget(project, budget, settings));
+        self.console_cache.insert(root, (current_version, Arc::clone(&list)));
         list
     }
 
     fn migrations(&mut self, project: &Project) -> Arc<Vec<MigrationInfo>> {
-        self.migrations_with_budget(project, None)
+        self.migrations_with_budget(project, None, None)
     }
 
-    fn migrations_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<MigrationInfo>> {
+    fn migrations_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<MigrationInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.migrations_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.migrations_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
-        let list = Arc::new(list_migrations_with_budget(project, budget));
-        self.migrations_cache.insert(root, Arc::clone(&list));
+        let list = Arc::new(list_migrations_with_budget(project, budget, settings));
+        self.migrations_cache.insert(root, (current_version, Arc::clone(&list)));
         list
     }
 
     fn behaviors(&mut self, project: &Project) -> Arc<Vec<BehaviorInfo>> {
-        self.behaviors_with_budget(project, None)
+        self.behaviors_with_budget(project, None, None)
     }
 
-    fn behaviors_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<BehaviorInfo>> {
+    fn behaviors_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<BehaviorInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.behaviors_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.behaviors_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
-        let list = Arc::new(list_behaviors_with_budget(project, budget));
-        self.behaviors_cache.insert(root, Arc::clone(&list));
+        let list = Arc::new(list_behaviors_with_budget(project, budget, settings));
+        self.behaviors_cache.insert(root, (current_version, Arc::clone(&list)));
         list
     }
 
-    fn widgets(&mut self, project: &Project) -> Arc<Vec<WidgetInfo>> {
-        self.widgets_with_budget(project, None)
+    fn widgets(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<Vec<WidgetInfo>> {
+        self.widgets_with_budget(project, None, settings)
     }
 
-    fn widgets_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>) -> Arc<Vec<WidgetInfo>> {
+    fn widgets_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<WidgetInfo>> {
         let root = project.root().unwrap_or_default();
-        if let Some(list) = self.widgets_cache.get(&root) {
-            return Arc::clone(list);
+        let current_version = get_cache_version();
+        if let Some((version, list)) = self.widgets_cache.get(&root) {
+            if *version == current_version {
+                return Arc::clone(list);
+            }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
-        let list = Arc::new(list_widgets_with_budget(project, budget));
-        self.widgets_cache.insert(root, Arc::clone(&list));
+        let list = Arc::new(list_widgets_with_budget(project, budget, settings));
+        self.widgets_cache.insert(root, (current_version, Arc::clone(&list)));
         list
     }
 
-    fn create_view_file(&self, project: &Project, view: &str) -> Result<String, Error> {
+    fn create_view_file(&self, project: &Project, view: &str, vars: Option<Vec<ViewVarInfo>>) -> Result<String, Error> {
         let root = project.root()?;
-        let rel = format!("views/{view}.php");
-        Ok(format!("{root}/{rel}"))
+        // Determine the correct view path based on controller context
+        let rel = if view.starts_with('/') {
+            format!("views/{}.php", view.trim_start_matches('/'))
+        } else if view.contains('/') {
+            format!("views/{view}.php")
+        } else {
+            format!("views/{view}.php")
+        };
+        let full_path = format!("{root}/{rel}");
+
+        // Generate view template with variables
+        let mut content = String::from("<?php\n\n");
+        content.push_str("/**\n");
+        content.push_str(r" * @var \yii\web\View $this
+");
+        if let Some(ref vars) = vars {
+            for v in vars {
+                content.push_str(&format!(r" * @var mixed ${}
+", v.name));
+            }
+        }
+        content.push_str(" */\n\n");
+        content.push_str(r"<?= $this->render('_form', [
+");
+        if let Some(ref vars) = vars {
+            for v in vars {
+                content.push_str(&format!(r"    '{}' => ${},
+", v.name, v.name));
+            }
+        }
+        content.push_str("]) ?>\n");
+
+        // File creation via editor.write API would be done in the command handler
+        // This method returns the intended path and content for now
+        Ok(full_path)
     }
 }
 
@@ -4024,6 +4453,31 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
+}
+
+/// Generate view file content with @var annotations and _form render call
+fn generate_view_content(vars: Option<Vec<ViewVarInfo>>) -> Result<String, Error> {
+    let mut content = String::from("<?php\n\n");
+    content.push_str("/**\n");
+    content.push_str(r" * @var \yii\web\View $this
+");
+    if let Some(ref vars) = vars {
+        for v in vars {
+            content.push_str(&format!(r" * @var mixed ${}
+", v.name));
+        }
+    }
+    content.push_str(" */\n\n");
+    content.push_str(r"<?= $this->render('_form', [
+");
+    if let Some(ref vars) = vars {
+        for v in vars {
+            content.push_str(&format!(r"    '{}' => ${},
+", v.name, v.name));
+        }
+    }
+    content.push_str("]) ?>\n");
+    Ok(content)
 }
 
 impl Plugin for Yii2Support {
@@ -4045,7 +4499,8 @@ impl Plugin for Yii2Support {
                     return Ok(Some("Cursor is not inside a render() view name.".into()));
                 };
                 let project = ctx.project().ok_or_else(|| Error::Invalid("open a project".into()))?;
-                let cctx = self.ctx_for_doc(&project, &path, &doc.text);
+                let settings = load_settings_for_project(&project);
+                let cctx = self.ctx_for_doc(&project, &path, &doc.text, Some(&settings));
                 if let Some(vpath) = resolve_view_path(&project, &name, cctx.as_ref()) {
                     host::open_location(&vpath, 0, 0)?;
                     Ok(None)
@@ -4055,7 +4510,7 @@ impl Plugin for Yii2Support {
             }
             "create-view" => {
                 let editor = ctx.editor().ok_or_else(|| Error::Invalid("focus a PHP editor".into()))?;
-                let _path = editor.path();
+                let path = editor.path();
                 let doc = editor.document()?;
                 let sel = editor.selections()?.into_iter().next();
                 let pos = sel.map(|r| r.start).unwrap_or(Position::new(0, 0));
@@ -4064,16 +4519,66 @@ impl Plugin for Yii2Support {
                     return Ok(Some("Cursor is not inside a render() view name.".into()));
                 };
                 let project = ctx.project().ok_or_else(|| Error::Invalid("open a project".into()))?;
-                let cctx = self.ctx_for_doc(&project, &_path, &doc.text);
+                let settings = load_settings_for_project(&project);
+                let cctx = self.ctx_for_doc(&project, &path, &doc.text, Some(&settings));
                 if resolve_view_path(&project, &name, cctx.as_ref()).is_some() {
                     return Ok(Some(format!("View `{name}` already exists.")));
                 }
-                let vpath = self.create_view_file(&project, &name)?;
+                // Extract variables from the render call
+                let vars = extract_render_calls(&doc.text)
+                    .into_iter()
+                    .find(|(v, _)| {
+                        let keys = render_view_keys(v, cctx.as_ref().unwrap_or(&ControllerInfo::default()));
+                        keys.iter().any(|k| k == &name || k.ends_with(&format!("/{name}")))
+                    })
+                    .map(|(_, vars)| vars);
+                let vpath = self.create_view_file(&project, &name, vars.clone())?;
+                // Generate view content
+                let content = generate_view_content(vars)?;
+                // Notify user with the path and content (file creation not available via API)
                 host::notify(
                     NotificationLevel::Info,
                     "Yii2 Support",
-                    &format!("Intended path for new view:\n{vpath}\n\n(File creation via host write is limited in the current API; create the file manually or extend the plugin.)"),
+                    &format!("View path: {vpath}\n\nContent:\n{content}\n\nPlease create the file manually."),
                 );
+                host::open_location(&vpath, 0, 0)?;
+                Ok(None)
+            }
+            "create-view-with-params" => {
+                let editor = ctx.editor().ok_or_else(|| Error::Invalid("focus a PHP editor".into()))?;
+                let path = editor.path();
+                let doc = editor.document()?;
+                let sel = editor.selections()?.into_iter().next();
+                let pos = sel.map(|r| r.start).unwrap_or(Position::new(0, 0));
+                let off = cursor_offset(&doc.text, pos);
+                let Some((name, _)) = view_context(&doc.text, off) else {
+                    return Ok(Some("Cursor is not inside a render() view name.".into()));
+                };
+                let project = ctx.project().ok_or_else(|| Error::Invalid("open a project".into()))?;
+                let settings = load_settings_for_project(&project);
+                let cctx = self.ctx_for_doc(&project, &path, &doc.text, Some(&settings));
+                if resolve_view_path(&project, &name, cctx.as_ref()).is_some() {
+                    return Ok(Some(format!("View `{name}` already exists.")));
+                }
+                // Get all variables for this view from the index
+                let view_vars = self.view_vars(&project, Some(&settings));
+                let keys = view_keys_from_path(&name);
+                let mut vars = Vec::new();
+                for key in &keys {
+                    if let Some(v) = view_vars.get(key) {
+                        vars.extend(v.clone());
+                    }
+                }
+                let vpath = self.create_view_file(&project, &name, Some(vars.clone()))?;
+                // Generate view content
+                let content = generate_view_content(Some(vars))?;
+                // Notify user with the path and content (file creation not available via API)
+                host::notify(
+                    NotificationLevel::Info,
+                    "Yii2 Support",
+                    &format!("View path: {vpath}\n\nContent:\n{content}\n\nPlease create the file manually."),
+                );
+                host::open_location(&vpath, 0, 0)?;
                 Ok(None)
             }
             "go-to-route" => {
@@ -4086,17 +4591,78 @@ impl Plugin for Yii2Support {
                     return Ok(Some("Cursor is not inside a route string (Url::to / redirect / …).".into()));
                 };
                 let project = ctx.project().ok_or_else(|| Error::Invalid("open a project".into()))?;
-                let ctrls = self.controllers(&project);
-                let rules = self.url_rules(&project);
+                let settings = load_settings_for_project(&project);
+                let ctrls = self.controllers_with_budget(&project, None, Some(&settings));
+                let rules = self.url_rules_with_budget(&project, None, Some(&settings));
                 if let Some(info) = resolve_route(&route, &ctrls, &rules) {
-                    host::open_location(&info.controller_path, 0, 0)?;
+                    // Find the exact line of the action method
+                    let action_line = info.action.as_ref().and_then(|action_method| {
+                        project.read_file(&info.controller_path).ok().and_then(|text| {
+                            find_action_line(&text, action_method)
+                        })
+                    });
+                    let line = action_line.unwrap_or(0);
+                    host::open_location(&info.controller_path, line, 0)?;
                     Ok(None)
                 } else {
                     Ok(Some(format!("Route `{route}` not resolved to a controller.")))
                 }
             }
+            "yii-migrate" => {
+                let project = ctx.project().ok_or_else(|| Error::Invalid("open a project".into()))?;
+                let root = project.root()?;
+                // Run yii migrate via PHP process
+                let output = run_yii_console(&root, &["migrate"])?;
+                host::notify(
+                    NotificationLevel::Info,
+                    "Yii2 Migration",
+                    &format!("Migration output:\n{output}"),
+                );
+                // Invalidate migrations cache after running
+                invalidate_all_caches();
+                Ok(None)
+            }
+            "yii-migrate-create" => {
+                let project = ctx.project().ok_or_else(|| Error::Invalid("open a project".into()))?;
+                let _root = project.root()?;
+                // Create a new migration - would need a name from user input
+                // For now, just show the command
+                host::notify(
+                    NotificationLevel::Info,
+                    "Yii2 Migration",
+                    "To create a migration, run: php yii migrate/create migration_name\n\nThis command requires interactive input for the migration name.",
+                );
+                Ok(None)
+            }
+            "invalidate-indexes" => {
+                invalidate_all_caches();
+                host::notify(
+                    NotificationLevel::Info,
+                    "Yii2 Support",
+                    "All indexes invalidated. They will be rebuilt on next request.",
+                );
+                Ok(None)
+            }
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
+    }
+}
+
+/// Run a Yii console command via PHP process.
+fn run_yii_console(root: &str, args: &[&str]) -> Result<String, Error> {
+    use std::process::Command;
+    let mut cmd = Command::new("php");
+    cmd.arg("yii");
+    cmd.args(args);
+    cmd.current_dir(root);
+    let output = cmd.output().map_err(|e| Error::Invalid(format!("Failed to run yii console: {e}")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(Error::Invalid(format!(
+            "Yii console failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
     }
 }
 
@@ -4108,6 +4674,10 @@ impl Providers for Yii2Support {
         if off > doc.text.len() {
             return Vec::new();
         }
+
+        // Load settings
+        let project = project_of(&doc.path);
+        let settings = project.as_ref().map(|p| load_settings_for_project(p)).unwrap_or_default();
 
         // --- Yii2 JavaScript (ActiveForm, validation, gridView, pjax) ---
         if is_js_lang(&doc.language) {
@@ -4141,7 +4711,7 @@ impl Providers for Yii2Support {
                 items.push(item(cls, CompletionKind::Class, "Yii component", cls));
             }
             if !items.is_empty() {
-                items.truncate(MAX_COMPLETION);
+                items.truncate(settings.performance.max_completions);
                 return items;
             }
         }
@@ -4150,9 +4720,9 @@ impl Providers for Yii2Support {
         if doc.path.contains("/views/") || doc.path.contains("\\views\\") {
             if let Some(partial) = view_dollar_var_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    let idx = self.view_vars(&project);
+                    let idx = self.view_vars(&project, Some(&settings));
                     let keys = view_keys_from_path(&doc.path);
-                    let mut seen = BTreeSet::new();
+                    let mut seen = FastSet::default();
                     for key in &keys {
                         if let Some(vars) = idx.get(key) {
                             for v in vars {
@@ -4202,7 +4772,7 @@ impl Providers for Yii2Support {
                     }
                 }
                 if !items.is_empty() {
-                    items.truncate(MAX_COMPLETION);
+                    items.truncate(settings.performance.max_completions);
                     return items;
                 }
             }
@@ -4213,10 +4783,10 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if let Some((partial, _)) = view_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    let cctx = self.ctx_for_doc(&project, &doc.path, &doc.text);
-                    let all = self.views_with_budget(&project, Some(&mut budget));
+                    let cctx = self.ctx_for_doc(&project, &doc.path, &doc.text, Some(&settings));
+                    let all = self.views_with_budget(&project, Some(&mut budget), Some(&settings));
                     let ordered = list_views_for_context(&all, cctx.as_ref());
-                    let mut seen = BTreeSet::new();
+                    let mut seen = FastSet::default();
                     for v in ordered {
                         if budget.check() == false { break; }
                         if !(v.contains(&partial) || partial.is_empty()) {
@@ -4239,7 +4809,7 @@ impl Providers for Yii2Support {
                     }
                 }
                 if !items.is_empty() {
-                    items.truncate(MAX_COMPLETION);
+                    items.truncate(settings.performance.max_completions);
                     return items;
                 }
             }
@@ -4249,9 +4819,9 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if let Some((arg, _)) = i18n_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    let catalog = self.messages_with_budget(&project, Some(&mut budget));
+                    let catalog = self.messages_with_budget(&project, Some(&mut budget), Some(&settings));
                     if arg == 0 {
-                        let mut cats: BTreeSet<String> = catalog.keys().cloned().collect();
+                        let mut cats: FastSet<String> = catalog.keys().cloned().collect();
                         for c in ["app", "yii"] {
                             cats.insert(c.into());
                         }
@@ -4276,7 +4846,7 @@ impl Providers for Yii2Support {
                     }
                 }
                 if !items.is_empty() {
-                    items.truncate(MAX_COMPLETION);
+                    items.truncate(settings.performance.max_completions);
                     return items;
                 }
             }
@@ -4287,7 +4857,7 @@ impl Providers for Yii2Support {
             if let Some(var) = field_model_var(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
                     let attrs = self.attributes_for_var(&project, &doc.text, &var);
-                    let mut seen = BTreeSet::new();
+                    let mut seen = FastSet::default();
                     for (a, cls) in attrs {
                         if seen.insert(a.clone()) {
                             items.push(item(
@@ -4306,9 +4876,9 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if let Some(cursor) = route_cursor(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    let rules = self.url_rules_with_budget(&project, Some(&mut budget));
+                    let rules = self.url_rules_with_budget(&project, Some(&mut budget), Some(&settings));
                     let routes = self.routes_with_params(&project);
-                    let ctrls = self.controllers_with_budget(&project, Some(&mut budget));
+                    let ctrls = self.controllers_with_budget(&project, Some(&mut budget), Some(&settings));
 
                     let collect_params = |route: &str| -> Vec<String> {
                         let mut all = params_for_route(route, rules.as_ref());
@@ -4350,7 +4920,7 @@ impl Providers for Yii2Support {
                             }
                         }
                         RouteCursor::RouteName { name: partial, .. } => {
-                            let mut seen = BTreeSet::new();
+                            let mut seen = FastSet::default();
                             for r in &routes {
                                 if budget.check() == false { break; }
                                 if r.route.contains(&partial) || partial.is_empty() {
@@ -4401,7 +4971,7 @@ impl Providers for Yii2Support {
 
         
         if !items.is_empty() {
-            items.truncate(MAX_COMPLETION);
+            items.truncate(settings.performance.max_completions);
             return items;
         }
 
@@ -4409,7 +4979,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if let Some((partial, _, _)) = alias_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    for a in self.aliases_with_budget(&project, Some(&mut budget)).iter() {
+                    for a in self.aliases_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                         if budget.check() == false { break; }
                         if a.name.contains(&partial) || partial.is_empty() || partial == "@" {
                             items.push(item(
@@ -4428,7 +4998,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if let Some((comp, partial)) = app_component_member_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    let comps = self.components_with_budget(&project, Some(&mut budget));
+                    let comps = self.components_with_budget(&project, Some(&mut budget), Some(&settings));
                     let class = comps
                         .iter()
                         .find(|c| c.id == comp)
@@ -4455,7 +5025,7 @@ impl Providers for Yii2Support {
                 }
             } else if let Some((partial, _, _)) = app_component_context(&doc.text, off) {
                 let comps = if let Some(project) = project_of(&doc.path) {
-                    self.components_with_budget(&project, Some(&mut budget))
+                    self.components_with_budget(&project, Some(&mut budget), Some(&settings))
                 } else {
                     Arc::new(builtin_components())
                 };
@@ -4475,7 +5045,7 @@ impl Providers for Yii2Support {
             // --- Config: components key completion ---
             if let Some(partial) = config_components_key_context(&doc.text, off) {
                 let comps = if let Some(project) = project_of(&doc.path) {
-                    self.components_with_budget(&project, Some(&mut budget))
+                    self.components_with_budget(&project, Some(&mut budget), Some(&settings))
                 } else {
                     Arc::new(builtin_components())
                 };
@@ -4501,7 +5071,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if let Some((partial, _, _)) = asset_file_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    let assets = self.assets_with_budget(&project, Some(&mut budget));
+                    let assets = self.assets_with_budget(&project, Some(&mut budget), Some(&settings));
                     // if current file is an asset, complete its known files + path hints
                     if let Some(info) = parse_asset_bundle(&doc.path, &doc.text) {
                         for f in info.js.iter().chain(info.css.iter()) {
@@ -4532,7 +5102,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if behaviors_class_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    for b in self.behaviors_with_budget(&project, Some(&mut budget)).iter() {
+                    for b in self.behaviors_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                         if budget.check() == false { break; }
                         items.push(item(
                             b.class.clone(),
@@ -4553,7 +5123,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if widget_class_context(&doc.text, off) {
                 if let Some(project) = project_of(&doc.path) {
-                    for w in self.widgets_with_budget(&project, Some(&mut budget)).iter() {
+                    for w in self.widgets_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                         if budget.check() == false { break; }
                         items.push(item(w.class.clone(), CompletionKind::Class, "widget", w.class.clone()));
                     }
@@ -4565,7 +5135,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if doc.path.contains("/commands/") || doc.path.contains("/console/") {
                 if let Some(project) = project_of(&doc.path) {
-                    for cmd in self.console_commands_with_budget(&project, Some(&mut budget)).iter() {
+                    for cmd in self.console_commands_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                         if budget.check() == false { break; }
                         items.push(item(
                             cmd.id.clone(),
@@ -4591,7 +5161,7 @@ impl Providers for Yii2Support {
         if !is_first_request {
             if doc.path.contains("/migrations/") {
                 if let Some(project) = project_of(&doc.path) {
-                    for m in self.migrations_with_budget(&project, Some(&mut budget)).iter() {
+                    for m in self.migrations_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                         if budget.check() == false { break; }
                         items.push(item(m.name.clone(), CompletionKind::File, "migration", m.name.clone()));
                     }
@@ -4600,7 +5170,7 @@ impl Providers for Yii2Support {
         }
 
         if items.len() > MAX_COMPLETION {
-            items.truncate(MAX_COMPLETION);
+            items.truncate(settings.performance.max_completions);
         }
         // Mark that first request is done; subsequent requests will do full project scans.
         self.initial_scan_done = true;
@@ -4620,8 +5190,11 @@ impl Providers for Yii2Support {
             return Vec::new();
         };
 
+        // Load settings
+        let settings = load_settings_for_project(&project);
+
         if let Some((name, _)) = view_context(&doc.text, off) {
-            let cctx = self.ctx_for_doc(&project, &doc.path, &doc.text);
+            let cctx = self.ctx_for_doc(&project, &doc.path, &doc.text, Some(&settings));
             if let Some(path) = resolve_view_path(&project, &name, cctx.as_ref()) {
                 return vec![Location {
                     path,
@@ -4631,12 +5204,19 @@ impl Providers for Yii2Support {
         }
 
         if let Some((route, _)) = route_context(&doc.text, off) {
-            let ctrls = self.controllers_with_budget(&project, Some(&mut budget));
-            let rules = self.url_rules_with_budget(&project, Some(&mut budget));
+            let ctrls = self.controllers_with_budget(&project, Some(&mut budget), Some(&settings));
+            let rules = self.url_rules_with_budget(&project, Some(&mut budget), Some(&settings));
             if let Some(info) = resolve_route(&route, &ctrls, &rules) {
+                // Find the exact line of the action method
+                let action_line = info.action.as_ref().and_then(|action_method| {
+                    project.read_file(&info.controller_path).ok().and_then(|text| {
+                        find_action_line(&text, action_method)
+                    })
+                });
+                let line = action_line.unwrap_or(0);
                 return vec![Location {
                     path: info.controller_path,
-                    range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                    range: Range::new(Position::new(line, 0), Position::new(line, 0)),
                 }];
             }
         }
@@ -4655,7 +5235,7 @@ impl Providers for Yii2Support {
             }
             // Indexed assets with matching entry
             let nrel = normalize_asset_entry(&rel);
-            for a in self.assets_with_budget(&project, Some(&mut budget)).values() {
+            for a in self.assets_with_budget(&project, Some(&mut budget), Some(&settings)).values() {
                 if budget.check() == false { break; }
                 if a.js.iter().any(|j| normalize_asset_entry(j) == nrel)
                     || a.css.iter().any(|c| normalize_asset_entry(c) == nrel)
@@ -4685,7 +5265,7 @@ impl Providers for Yii2Support {
 
         // Yii::$app->component → class file, else config declaration
         if let Some((partial, _, _)) = app_component_context(&doc.text, off) {
-            for c in self.components_with_budget(&project, Some(&mut budget)).iter() {
+            for c in self.components_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                 if budget.check() == false { break; }
                 if c.id == partial {
                     if let Some(cp) = &c.class_path {
@@ -4713,7 +5293,7 @@ impl Providers for Yii2Support {
         }
         // Also when cursor is on full id word after Yii::$app->
         if let Some((comp, _)) = app_component_member_context(&doc.text, off) {
-            for c in self.components_with_budget(&project, Some(&mut budget)).iter() {
+            for c in self.components_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                 if budget.check() == false { break; }
                 if c.id == comp {
                     if let Some(cp) = &c.class_path {
@@ -4747,7 +5327,7 @@ impl Providers for Yii2Support {
         };
         if !word.is_empty() {
             let short = word.rsplit('\\').next().unwrap_or(&word).to_owned();
-            for b in self.behaviors_with_budget(&project, Some(&mut budget)).iter() {
+            for b in self.behaviors_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                 if budget.check() == false { break; }
                 if b.class == short || b.class.ends_with(&short) {
                     return vec![Location {
@@ -4756,7 +5336,7 @@ impl Providers for Yii2Support {
                     }];
                 }
             }
-            for w in self.widgets_with_budget(&project, Some(&mut budget)).iter() {
+            for w in self.widgets_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                 if budget.check() == false { break; }
                 if w.class == short || w.class.ends_with(&short) {
                     return vec![Location {
@@ -4765,7 +5345,7 @@ impl Providers for Yii2Support {
                     }];
                 }
             }
-            for a in self.assets_with_budget(&project, Some(&mut budget)).values() {
+            for a in self.assets_with_budget(&project, Some(&mut budget), Some(&settings)).values() {
                 if budget.check() == false { break; }
                 if a.class == short || a.class.ends_with(&short) {
                     return vec![Location {
@@ -4774,7 +5354,7 @@ impl Providers for Yii2Support {
                     }];
                 }
             }
-            for cmd in self.console_commands_with_budget(&project, Some(&mut budget)).iter() {
+            for cmd in self.console_commands_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                 if budget.check() == false { break; }
                 if cmd.class == short || cmd.id == word {
                     return vec![Location {
@@ -4783,7 +5363,7 @@ impl Providers for Yii2Support {
                     }];
                 }
             }
-            for m in self.migrations_with_budget(&project, Some(&mut budget)).iter() {
+            for m in self.migrations_with_budget(&project, Some(&mut budget), Some(&settings)).iter() {
                 if budget.check() == false { break; }
                 if m.name == word || m.name == short {
                     return vec![Location {
@@ -4808,7 +5388,8 @@ impl Providers for Yii2Support {
         let Some(project) = project_of(&doc.path) else {
             return Vec::new();
         };
-        let cctx = self.ctx_for_doc(&project, &doc.path, &doc.text);
+        let settings = load_settings_for_project(&project);
+        let cctx = self.ctx_for_doc(&project, &doc.path, &doc.text, Some(&settings));
         if resolve_view_path(&project, &name, cctx.as_ref()).is_some() {
             return Vec::new();
         }
@@ -4936,7 +5517,7 @@ mod tests {
 
     #[test]
     fn routes_from_controller_actions() {
-        let mut map = BTreeMap::new();
+        let mut map = FastMap::default();
         map.insert(
             "site".into(),
             ControllerInfo {
