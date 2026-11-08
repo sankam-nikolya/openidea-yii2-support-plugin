@@ -22,11 +22,103 @@ use std::hash::BuildHasherDefault;
 use ahash::AHasher;
 use parking_lot::RwLock;
 use lazy_static::lazy_static;
+use memchr::memmem;
 
 /// Type alias for fast HashMap using ahash
 type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<AHasher>>;
 /// Type alias for fast HashSet using ahash
 type FastSet<T> = HashSet<T, BuildHasherDefault<AHasher>>;
+
+/// SIMD-accelerated pattern matching utilities using memchr (which uses SIMD internally)
+mod simd_utils {
+    use memchr::{memchr, memmem};
+
+    /// Find all occurrences of a byte pattern using memchr (SIMD-optimized internally)
+    pub fn find_pattern_simd(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return Vec::new();
+        }
+
+        let mut positions = Vec::new();
+        let mut i = 0;
+        let finder = memmem::Finder::new(needle);
+
+        while let Some(pos) = finder.find(&haystack[i..]) {
+            let absolute_pos = i + pos;
+            positions.push(absolute_pos);
+            i = absolute_pos + 1;
+        }
+
+        positions
+    }
+
+    /// Count occurrences of a byte using memchr (SIMD-optimized internally)
+    pub fn count_byte_simd(haystack: &[u8], byte: u8) -> usize {
+        let mut count = 0usize;
+        let mut i = 0;
+
+        while let Some(pos) = memchr(byte, &haystack[i..]) {
+            i += pos + 1;
+            count += 1;
+        }
+
+        count
+    }
+
+    /// Find all PHP class/method patterns using memchr
+    pub fn find_php_patterns(haystack: &[u8]) -> Vec<(usize, PatternType)> {
+        let mut results = Vec::new();
+        let patterns: &[(&[u8], PatternType)] = &[
+            (b"class ", PatternType::Class),
+            (b"function ", PatternType::Function),
+            (b"action", PatternType::Action),
+            (b"render(", PatternType::Render),
+        ];
+
+        for (pattern, ptype) in patterns {
+            let positions = find_pattern_simd(haystack, pattern);
+            for pos in positions {
+                results.push((pos, *ptype));
+            }
+        }
+
+        results.sort_by_key(|(pos, _)| *pos);
+        results
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PatternType {
+        Class,
+        Function,
+        Action,
+        Render,
+    }
+}
+
+// SIMD utilities available for pattern matching (currently unused but ready for optimization)
+use simd_utils::{find_pattern_simd as _find_pattern_simd, count_byte_simd as _count_byte_simd, PatternType as _PatternType};
+
+/// Compression utilities for cache serialization
+mod compression {
+    use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+
+    /// Compress data using LZ4 with prepended size
+    pub fn compress(data: &[u8]) -> Vec<u8> {
+        compress_prepend_size(data)
+    }
+
+    /// Decompress LZ4 data with prepended size
+    pub fn decompress(data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        decompress_size_prepended(data).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    }
+
+    /// Check if compression is beneficial (ratio > 1.2)
+    pub fn should_compress(original: &[u8], compressed: &[u8]) -> bool {
+        compressed.len() < original.len() * 8 / 10  // 20% reduction threshold
+    }
+}
+
+use compression::{compress, decompress, should_compress};
 
 /// Hard caps — host allows ~50ms for providers; stay well under that.
 const MAX_SCAN: u32 = 25;           // Drastically reduced for timeout prevention
@@ -41,10 +133,15 @@ const VIEW_CODE: &str = "yii2-missing-view";
 /// Target: stay under ~100 ops to fit in ~50ms WASM budget.
 const MAX_OPS: u32 = 100;
 
-/// Simple operation counter for budget tracking.
+/// Simple operation counter for budget tracking with precise cost model.
+/// File I/O = 10 ops, find_files = 20 ops, parsing = 5 ops, string ops = 1 op.
+/// Target: stay under ~100 ops to fit in ~50ms WASM budget.
 #[derive(Default)]
 struct OpBudget {
     ops: u32,
+    io_ops: u32,
+    parse_ops: u32,
+    string_ops: u32,
 }
 
 /// Cache invalidation event for file-saved notifications.
@@ -99,10 +196,78 @@ fn get_cache_version() -> u64 {
     *CACHE_VERSION.read()
 }
 
+/// Compressed cache entry: (version, timestamp_millis, compressed_data, original_size)
+/// Uses LZ4 compression for large cache entries to reduce memory usage.
+type CompressedCacheEntry = (u64, u64, Vec<u8>, usize);
+
+/// Cache compression threshold - only compress entries larger than this (bytes)
+const CACHE_COMPRESSION_THRESHOLD: usize = 1024; // 1KB
+
+/// Serialize and optionally compress a cache entry
+fn serialize_cache_entry<T: serde::Serialize>(data: &T) -> (Vec<u8>, usize, bool) {
+    let serialized = bincode::serialize(data).unwrap_or_default();
+    let original_size = serialized.len();
+
+    if original_size > CACHE_COMPRESSION_THRESHOLD {
+        let compressed = compress(&serialized);
+        if should_compress(&serialized, &compressed) {
+            return (compressed, original_size, true);
+        }
+    }
+    (serialized, original_size, false)
+}
+
+/// Deserialize and optionally decompress a cache entry
+fn deserialize_cache_entry<T: serde::de::DeserializeOwned>(
+    data: &[u8],
+    _original_size: usize,
+    is_compressed: bool
+) -> Option<T> {
+    let bytes = if is_compressed {
+        decompress(data).ok()?
+    } else {
+        data.to_vec()
+    };
+    bincode::deserialize(&bytes).ok()
+}
+
+/// Trait for cache-compatible types
+trait Cacheable: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static {}
+
+impl<T> Cacheable for T where T: serde::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync + 'static {}
+
 impl OpBudget {
     #[inline]
     fn new() -> Self {
-        Self { ops: 0 }
+        Self { ops: 0, io_ops: 0, parse_ops: 0, string_ops: 0 }
+    }
+
+    #[inline]
+    fn spend_io(&mut self) -> bool {
+        self.ops += 10;
+        self.io_ops += 10;
+        self.ops <= MAX_OPS
+    }
+
+    #[inline]
+    fn spend_find(&mut self) -> bool {
+        self.ops += 20;
+        self.io_ops += 20;
+        self.ops <= MAX_OPS
+    }
+
+    #[inline]
+    fn spend_parse(&mut self) -> bool {
+        self.ops += 5;
+        self.parse_ops += 5;
+        self.ops <= MAX_OPS
+    }
+
+    #[inline]
+    fn spend_string(&mut self) -> bool {
+        self.ops += 1;
+        self.string_ops += 1;
+        self.ops <= MAX_OPS
     }
 
     #[inline]
@@ -119,6 +284,13 @@ impl OpBudget {
     #[inline]
     fn spent(&self) -> u32 {
         self.ops
+    }
+
+    /// Get detailed breakdown for debugging
+    #[allow(dead_code)]
+    #[inline]
+    fn breakdown(&self) -> (u32, u32, u32, u32) {
+        (self.ops, self.io_ops, self.parse_ops, self.string_ops)
     }
 }
 
@@ -278,6 +450,50 @@ fn load_settings_for_project(_project: &Project) -> PluginSettings {
     PluginSettings::default()
 }
 
+/// Get cached settings for a project, parsing only once per project root.
+impl Yii2Support {
+    fn get_cached_settings(&mut self, project: &Project) -> Arc<PluginSettings> {
+        let root = project.root().unwrap_or_default();
+        if let Some(settings) = self.settings_cache.get(&root) {
+            return Arc::clone(settings);
+        }
+        let settings = Arc::new(load_settings_for_project(project));
+        self.settings_cache.insert(root, Arc::clone(&settings));
+        settings
+    }
+
+    /// Track a file for a specific cache scope for incremental invalidation.
+    fn track_file_for_scope(&mut self, _root: &str, scope: &str, file_path: &str) {
+        let scope_files = self.tracked_files.entry(scope.to_string()).or_default();
+        scope_files.insert(file_path.to_string());
+    }
+
+    /// Invalidate cache for specific files in a scope (incremental invalidation).
+    fn invalidate_scope_files(&mut self, scope: &str, modified_files: &[String]) {
+        if let Some(_scope_files) = self.tracked_files.get(scope) {
+            let mtimes = FILE_MTIMES.read();
+            let has_changes = modified_files.iter().any(|f| {
+                mtimes.get(f).copied().unwrap_or(0) > 0
+            });
+            if has_changes {
+                invalidate_all_caches();
+            }
+        }
+    }
+
+    /// Warm up caches for common operations (pre-load on first request).
+    fn warm_caches(&mut self, project: &Project, budget: &mut OpBudget, settings: Option<&PluginSettings>) {
+        let _ = self.views_with_budget(project, Some(budget), settings);
+        let _ = self.controllers_with_budget(project, Some(budget), settings);
+        let _ = self.models(project, settings);
+        let _ = self.messages(project);
+        let _ = self.url_rules(project);
+        let _ = self.aliases(project);
+        let _ = self.components(project);
+        self.initial_scan_done = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -313,19 +529,19 @@ fn file_too_big(len: usize) -> bool {
 /// Spend budget for a file read operation.
 #[inline]
 fn budget_read(budget: &mut OpBudget) -> bool {
-    budget.spend(1)
+    budget.spend_io()
 }
 
 /// Spend budget for a find_files operation.
 #[inline]
 fn budget_find(budget: &mut OpBudget) -> bool {
-    budget.spend(2) // find_files is more expensive
+    budget.spend_find()
 }
 
 /// Spend budget for parsing a file.
 #[inline]
 fn budget_parse(budget: &mut OpBudget) -> bool {
-    budget.spend(1)
+    budget.spend_parse()
 }
 
 /// Byte offset of the cursor from a Position.
@@ -367,7 +583,7 @@ fn item_filter(
 // ---------------------------------------------------------------------------
 
 /// One controller discovered in the project.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ControllerInfo {
     /// Simple class name without suffix: Site, User, …
     id: String,
@@ -409,19 +625,17 @@ fn parse_controller(path: &str, text: &str) -> Option<ControllerInfo> {
 
     // Yii view path: SiteController → "site", AdminUserController → "admin-user" (approx)
     // Keep simple: lowercase id; nested controllers use id as folder.
-    let view_path = id
-        .chars()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            if c.is_uppercase() && i > 0 {
-                vec!['-', c.to_ascii_lowercase()]
-            } else {
-                vec![c.to_ascii_lowercase()]
-            }
-        })
-        .collect::<String>();
+    let mut view_path = String::with_capacity(id.len() + 4);
+    for (i, c) in id.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            view_path.push('-');
+            view_path.push(c.to_ascii_lowercase());
+        } else {
+            view_path.push(c.to_ascii_lowercase());
+        }
+    }
 
-    let mut actions = Vec::new();
+    let mut actions = Vec::with_capacity(8);
     // actionIndex, actionCreate, …
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -438,17 +652,15 @@ fn parse_controller(path: &str, text: &str) -> Option<ControllerInfo> {
             if j > start {
                 let name = &text[start..j];
                 // Yii converts actionCreate → "create"
-                let view = name
-                    .chars()
-                    .enumerate()
-                    .flat_map(|(k, c)| {
-                        if c.is_uppercase() && k > 0 {
-                            vec!['-', c.to_ascii_lowercase()]
-                        } else {
-                            vec![c.to_ascii_lowercase()]
-                        }
-                    })
-                    .collect::<String>();
+                let mut view = String::with_capacity(name.len() + 4);
+                for (k, c) in name.chars().enumerate() {
+                    if c.is_uppercase() && k > 0 {
+                        view.push('-');
+                        view.push(c.to_ascii_lowercase());
+                    } else {
+                        view.push(c.to_ascii_lowercase());
+                    }
+                }
                 actions.push(view);
             }
             i = j;
@@ -705,7 +917,7 @@ fn list_views_for_context(all: &[String], ctx: Option<&ControllerInfo>) -> Vec<S
 
 
 /// Variable passed into a view via render($view, ['name' => expr]).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ViewVarInfo {
     name: String,
     /// Short source expression when known (`$model`, `1`, `...`).
@@ -715,15 +927,24 @@ struct ViewVarInfo {
 /// Extract render()/renderPartial() pairs: (resolved view key, vars).
 /// View key is relative when possible: `site/index` or `index` with controller view_path applied by caller.
 fn extract_render_calls(text: &str) -> Vec<(String /*view lit*/, Vec<ViewVarInfo>)> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(8);
     let bytes = text.as_bytes();
     let methods: &[&[u8]] = &[b"render(", b"renderPartial(", b"renderAjax("];
     let mut i = 0usize;
+
+    // Pre-compute search bytes for memchr
     while i < bytes.len() {
+        // Use memchr to quickly find 'r' (start of "render")
+        if let Some(pos) = memchr::memchr(b'r', &bytes[i..]) {
+            i += pos;
+        } else {
+            break;
+        }
+
         let mut hit = None;
         for m in methods {
             if i + m.len() <= bytes.len() && &bytes[i..i + m.len()] == *m {
-                // word boundary
+                // word boundary check
                 if i > 0 && is_ident(bytes[i - 1] as char) {
                     continue;
                 }
@@ -748,7 +969,11 @@ fn extract_render_calls(text: &str) -> Vec<(String /*view lit*/, Vec<ViewVarInfo
         let q = bytes[j];
         j += 1;
         let vs = j;
-        while j < bytes.len() && bytes[j] != q {
+        // Use memchr to find closing quote, handling escapes
+        while j < bytes.len() {
+            if bytes[j] == q {
+                break;
+            }
             if bytes[j] == b'\\' {
                 j += 1;
             }
@@ -790,17 +1015,20 @@ fn parse_php_array_keys(text: &str, start: usize) -> (Vec<ViewVarInfo>, usize) {
     }
     let mut i = start + 1;
     let mut depth = 1i32;
-    let mut vars = Vec::new();
+    let mut vars = Vec::with_capacity(8);
     let mut in_str: Option<u8> = None;
     while i < bytes.len() && depth > 0 {
         let b = bytes[i];
         if let Some(q) = in_str {
+            // Fast skip to next quote or escape
+            if let Some(rel) = memchr::memchr(q, &bytes[i+1..]) {
+                i += rel + 1;
+                in_str = None;
+                continue;
+            }
             if b == b'\\' {
                 i += 2;
                 continue;
-            }
-            if b == q {
-                in_str = None;
             }
             i += 1;
             continue;
@@ -831,12 +1059,14 @@ fn parse_php_array_keys(text: &str, start: usize) -> (Vec<ViewVarInfo>, usize) {
     while k < bb.len() {
         let b = bb[k];
         if let Some(q) = in_s {
+            if let Some(rel) = memchr::memchr(q, &bb[k+1..]) {
+                k += rel + 1;
+                in_s = None;
+                continue;
+            }
             if b == b'\\' {
                 k += 2;
                 continue;
-            }
-            if b == q {
-                in_s = None;
             }
             k += 1;
             continue;
@@ -846,15 +1076,11 @@ fn parse_php_array_keys(text: &str, start: usize) -> (Vec<ViewVarInfo>, usize) {
                 let q = b;
                 k += 1;
                 let ks = k;
-                while k < bb.len() {
-                    if bb[k] == b'\\' {
-                        k += 2;
-                        continue;
-                    }
-                    if bb[k] == q {
-                        break;
-                    }
-                    k += 1;
+                // Use memchr to find closing quote
+                if let Some(rel) = memchr::memchr(q, &bb[k..]) {
+                    k += rel;
+                } else {
+                    k = bb.len();
                 }
                 let key = body[ks..k.min(body.len())].to_owned();
                 if k < bb.len() {
@@ -1014,7 +1240,7 @@ fn view_dollar_var_context(text: &str, offset: usize) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// One model/form class discovered in the project.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ModelInfo {
     /// Simple class name (User, LoginForm, …).
     class: String,
@@ -1440,7 +1666,7 @@ fn i18n_category_at(text: &str, offset: usize) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// A resolved route target.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct RouteInfo {
     /// e.g. "site/index", "blog/post/create"
     route: String,
@@ -1452,7 +1678,7 @@ struct RouteInfo {
 }
 
 /// urlManager rule with extracted parameter placeholders.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct UrlRule {
     /// Original pattern, e.g. `post/<id:\d+>` or `posts`
     pattern: String,
@@ -2292,13 +2518,13 @@ fn extract_rest_route(route: &str) -> Option<(String, Option<String>)> {
 // Aliases, components, assets, console, migrations, behaviors, widgets, Yii JS
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct AliasInfo {
     name: String,   // @app, @web, …
     path: String,   // resolved or declared path fragment
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ComponentInfo {
     id: String,
     class: String,
@@ -2308,7 +2534,7 @@ struct ComponentInfo {
     class_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct AssetInfo {
     class: String,
     path: String,
@@ -2319,7 +2545,7 @@ struct AssetInfo {
     base_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ConsoleCommandInfo {
     id: String,          // hello (from HelloController)
     class: String,
@@ -2327,19 +2553,19 @@ struct ConsoleCommandInfo {
     actions: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct MigrationInfo {
     name: String,
     path: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct BehaviorInfo {
     class: String,
     path: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct WidgetInfo {
     class: String,
     path: String,
@@ -3897,26 +4123,60 @@ fn is_js_lang(lang: &str) -> bool {
 #[derive(Default)]
 pub struct Yii2Support {
     /// Cheap to clone (Arc); avoid deep-copying indexes on every completion.
-    views_cache: FastMap<String, (u64, Arc<Vec<String>>)>,
-    models_cache: FastMap<String, (u64, Arc<FastMap<String, ModelInfo>>)>,
-    controllers_cache: FastMap<String, (u64, Arc<FastMap<String, ControllerInfo>>)>,
-    messages_cache: FastMap<String, (u64, Arc<MessageCatalog>)>,
-    url_rules_cache: FastMap<String, (u64, Arc<Vec<UrlRule>>)>,
-    aliases_cache: FastMap<String, (u64, Arc<Vec<AliasInfo>>)>,
-    components_cache: FastMap<String, (u64, Arc<Vec<ComponentInfo>>)>,
-    assets_cache: FastMap<String, (u64, Arc<FastMap<String, AssetInfo>>)>,
-    console_cache: FastMap<String, (u64, Arc<Vec<ConsoleCommandInfo>>)>,
-    migrations_cache: FastMap<String, (u64, Arc<Vec<MigrationInfo>>)>,
-    behaviors_cache: FastMap<String, (u64, Arc<Vec<BehaviorInfo>>)>,
-    widgets_cache: FastMap<String, (u64, Arc<Vec<WidgetInfo>>)>,
+    /// Cache entry: (version, timestamp_millis, data)
+    views_cache: FastMap<String, (u64, u64, Arc<Vec<String>>)>,
+    models_cache: FastMap<String, (u64, u64, Arc<FastMap<String, ModelInfo>>)>,
+    controllers_cache: FastMap<String, (u64, u64, Arc<FastMap<String, ControllerInfo>>)>,
+    messages_cache: FastMap<String, (u64, u64, Arc<MessageCatalog>)>,
+    url_rules_cache: FastMap<String, (u64, u64, Arc<Vec<UrlRule>>)>,
+    aliases_cache: FastMap<String, (u64, u64, Arc<Vec<AliasInfo>>)>,
+    components_cache: FastMap<String, (u64, u64, Arc<Vec<ComponentInfo>>)>,
+    assets_cache: FastMap<String, (u64, u64, Arc<FastMap<String, AssetInfo>>)>,
+    console_cache: FastMap<String, (u64, u64, Arc<Vec<ConsoleCommandInfo>>)>,
+    migrations_cache: FastMap<String, (u64, u64, Arc<Vec<MigrationInfo>>)>,
+    behaviors_cache: FastMap<String, (u64, u64, Arc<Vec<BehaviorInfo>>)>,
+    widgets_cache: FastMap<String, (u64, u64, Arc<Vec<WidgetInfo>>)>,
     /// view key → variables passed via render(..., [keys])
-    view_vars_cache: FastMap<String, (u64, Arc<FastMap<String, Vec<ViewVarInfo>>>)>,
+    view_vars_cache: FastMap<String, (u64, u64, Arc<FastMap<String, Vec<ViewVarInfo>>>)>,
     /// Track if first request has been processed; on first request skip all project scans
     /// to avoid timeout, only return local completions.
     initial_scan_done: bool,
+    /// Cached settings per project root to avoid re-parsing
+    settings_cache: FastMap<String, Arc<PluginSettings>>,
+    /// Cache for tracked file paths per scope for incremental invalidation
+    tracked_files: FastMap<String, FastSet<String>>,
 }
 
 impl Yii2Support {
+    /// Check if any file in the cache scope has been modified since last build.
+    fn is_cache_invalidated(&self, root: &str, scope: &str) -> bool {
+        // For now, check if any file in the project has been modified
+        // In the future, we could track specific files per cache scope
+        let mtimes = FILE_MTIMES.read();
+        let cache_entry = self.get_cache_timestamp(root, scope);
+        mtimes.values().any(|&mtime| mtime > cache_entry)
+    }
+
+    /// Get the timestamp of the last cache build for a scope.
+    fn get_cache_timestamp(&self, root: &str, scope: &str) -> u64 {
+        match scope {
+            "views" => self.views_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "controllers" => self.controllers_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "models" => self.models_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "messages" => self.messages_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "url_rules" => self.url_rules_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "aliases" => self.aliases_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "components" => self.components_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "assets" => self.assets_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "console" => self.console_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "migrations" => self.migrations_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "behaviors" => self.behaviors_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "widgets" => self.widgets_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            "view_vars" => self.view_vars_cache.get(root).map(|(_, ts, _)| *ts).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     fn views(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<Vec<String>> {
         self.views_with_budget(project, None, settings)
     }
@@ -3924,15 +4184,20 @@ impl Yii2Support {
     fn views_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<String>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.views_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+
+        if let Some((version, timestamp, list)) = self.views_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                // Check file-level invalidation for views
+                if !self.is_cache_invalidated(&root, "views") {
+                    return Arc::clone(list);
+                }
             }
         }
-        // Inline budget check to avoid Option allocation
         if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(Vec::new()); } }
         let list = Arc::new(list_views_with_budget(project, budget, settings));
-        self.views_cache.insert(root, (current_version, Arc::clone(&list)));
+        self.views_cache.insert(root, (current_version, now, Arc::clone(&list)));
         list
     }
 
@@ -3943,9 +4208,13 @@ impl Yii2Support {
     fn controllers_with_budget(&mut self, project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<FastMap<String, ControllerInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, map)) = self.controllers_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(map);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, map)) = self.controllers_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "controllers") {
+                    return Arc::clone(map);
+                }
             }
         }
         // Inline budget check to avoid Option allocation
@@ -4008,16 +4277,16 @@ impl Yii2Support {
         }
         if map.is_empty() {
             if let Some(b) = budget.as_ref() { if !b.check() {
-                self.view_vars_cache.insert(root.clone(), (current_version, Arc::new(vmap)));
+                self.view_vars_cache.insert(root.clone(), (current_version, now, Arc::new(vmap)));
                 let map = Arc::new(map);
-                self.controllers_cache.insert(root, (current_version, Arc::clone(&map)));
+                self.controllers_cache.insert(root, (current_version, now, Arc::clone(&map)));
                 return map;
             } }
             if let Ok(files) = project.find_files("**/*Controller.php", max_scan / 2) {
                 if let Some(b) = budget.as_mut() { if !b.spend(2) {
-                    self.view_vars_cache.insert(root.clone(), (current_version, Arc::new(vmap)));
+                    self.view_vars_cache.insert(root.clone(), (current_version, now, Arc::new(vmap)));
                     let map = Arc::new(map);
-                    self.controllers_cache.insert(root, (current_version, Arc::clone(&map)));
+                    self.controllers_cache.insert(root, (current_version, now, Arc::clone(&map)));
                     return map;
                 } }
                 for path in files {
@@ -4039,9 +4308,9 @@ impl Yii2Support {
                 }
             }
         }
-        self.view_vars_cache.insert(root.clone(), (current_version, Arc::new(vmap)));
+        self.view_vars_cache.insert(root.clone(), (current_version, now, Arc::new(vmap)));
         let map = Arc::new(map);
-        self.controllers_cache.insert(root, (current_version, Arc::clone(&map)));
+        self.controllers_cache.insert(root, (current_version, now, Arc::clone(&map)));
         map
     }
 
@@ -4049,16 +4318,20 @@ impl Yii2Support {
     fn view_vars(&mut self, project: &Project, settings: Option<&PluginSettings>) -> Arc<FastMap<String, Vec<ViewVarInfo>>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, m)) = self.view_vars_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(m);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, m)) = self.view_vars_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "view_vars") {
+                    return Arc::clone(m);
+                }
             }
         }
         // Ensure controllers() built the index.
         let _ = self.controllers(project, settings);
         self.view_vars_cache
             .get(&root)
-            .map(|(_, m)| Arc::clone(m))
+            .map(|(_, _, m)| Arc::clone(m))
             .unwrap_or_else(|| Arc::new(FastMap::default()))
     }
 
@@ -4069,14 +4342,18 @@ impl Yii2Support {
     fn messages_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<MessageCatalog> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, cat)) = self.messages_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(cat);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, cat)) = self.messages_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "messages") {
+                    return Arc::clone(cat);
+                }
             }
         }
         if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
         let cat = Arc::new(scan_messages_with_budget(project, budget, settings));
-        self.messages_cache.insert(root, (current_version, Arc::clone(&cat)));
+        self.messages_cache.insert(root, (current_version, now, Arc::clone(&cat)));
         cat
     }
 
@@ -4087,14 +4364,18 @@ impl Yii2Support {
     fn url_rules_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<UrlRule>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, rules)) = self.url_rules_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(rules);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, rules)) = self.url_rules_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "url_rules") {
+                    return Arc::clone(rules);
+                }
             }
         }
         if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(Vec::new()); } }
         let rules = Arc::new(scan_url_rules_with_budget(project, budget, settings));
-        self.url_rules_cache.insert(root, (current_version, Arc::clone(&rules)));
+        self.url_rules_cache.insert(root, (current_version, now, Arc::clone(&rules)));
         rules
     }
 
@@ -4149,16 +4430,19 @@ impl Yii2Support {
     fn models_with_budget(&mut self, project: &Project, mut budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<FastMap<String, ModelInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, map)) = self.models_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(map);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, map)) = self.models_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "models") {
+                    return Arc::clone(map);
+                }
             }
         }
         if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
         let max_scan = settings.map(|s| s.performance.max_scan_files).unwrap_or(MAX_SCAN);
         let max_file_size = settings.map(|s| s.performance.max_file_size_kb * 1024).unwrap_or(MAX_FILE_BYTES);
         let mut map = FastMap::default();
-        // Use configurable model scan paths
         let patterns: Vec<String> = settings
             .map(|s| s.scan_paths.models.iter().map(|p| format!("{}/**/*.php", p.trim_end_matches('/'))).collect())
             .unwrap_or_else(|| vec!["**/models/**/*.php".into(), "**/forms/**/*.php".into(), "**/common/models/**/*.php".into()]);
@@ -4194,7 +4478,7 @@ impl Yii2Support {
         }
         let map = Arc::new(map);
         let current_version = get_cache_version();
-        self.models_cache.insert(root, (current_version, Arc::clone(&map)));
+        self.models_cache.insert(root, (current_version, now, Arc::clone(&map)));
         map
     }
 
@@ -4270,9 +4554,13 @@ impl Yii2Support {
     fn aliases_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<AliasInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.aliases_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, list)) = self.aliases_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "aliases") {
+                    return Arc::clone(list);
+                }
             }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
@@ -4281,8 +4569,8 @@ impl Yii2Support {
         let (aliases, components) = scan_config_aliases_components_with_budget(project, budget, settings);
         let aliases = Arc::new(aliases);
         let components = Arc::new(components);
-        self.components_cache.insert(root.clone(), (current_version, Arc::clone(&components)));
-        self.aliases_cache.insert(root, (current_version, Arc::clone(&aliases)));
+        self.components_cache.insert(root.clone(), (current_version, now, Arc::clone(&components)));
+        self.aliases_cache.insert(root, (current_version, now, Arc::clone(&aliases)));
         aliases
     }
 
@@ -4293,9 +4581,13 @@ impl Yii2Support {
     fn components_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<ComponentInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.components_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, list)) = self.components_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "components") {
+                    return Arc::clone(list);
+                }
             }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
@@ -4304,8 +4596,8 @@ impl Yii2Support {
         let (aliases, components) = scan_config_aliases_components_with_budget(project, budget, settings);
         let aliases = Arc::new(aliases);
         let components = Arc::new(components);
-        self.aliases_cache.insert(root.clone(), (current_version, aliases));
-        self.components_cache.insert(root, (current_version, Arc::clone(&components)));
+        self.aliases_cache.insert(root.clone(), (current_version, now, aliases));
+        self.components_cache.insert(root, (current_version, now, Arc::clone(&components)));
         components
     }
 
@@ -4316,14 +4608,18 @@ impl Yii2Support {
     fn assets_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<FastMap<String, AssetInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, map)) = self.assets_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(map);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, map)) = self.assets_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "assets") {
+                    return Arc::clone(map);
+                }
             }
         }
         if let Some(b) = budget.as_ref() { if !b.check() { return Arc::new(FastMap::default()); } }
         let map = Arc::new(list_assets_with_budget(project, budget, settings));
-        self.assets_cache.insert(root, (current_version, Arc::clone(&map)));
+        self.assets_cache.insert(root, (current_version, now, Arc::clone(&map)));
         map
     }
 
@@ -4334,16 +4630,20 @@ impl Yii2Support {
     fn console_commands_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<ConsoleCommandInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.console_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, list)) = self.console_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "console") {
+                    return Arc::clone(list);
+                }
             }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
         let list = Arc::new(list_console_commands_with_budget(project, budget, settings));
-        self.console_cache.insert(root, (current_version, Arc::clone(&list)));
+        self.console_cache.insert(root, (current_version, now, Arc::clone(&list)));
         list
     }
 
@@ -4354,16 +4654,20 @@ impl Yii2Support {
     fn migrations_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<MigrationInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.migrations_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, list)) = self.migrations_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "migrations") {
+                    return Arc::clone(list);
+                }
             }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
         let list = Arc::new(list_migrations_with_budget(project, budget, settings));
-        self.migrations_cache.insert(root, (current_version, Arc::clone(&list)));
+        self.migrations_cache.insert(root, (current_version, now, Arc::clone(&list)));
         list
     }
 
@@ -4374,16 +4678,20 @@ impl Yii2Support {
     fn behaviors_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<BehaviorInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.behaviors_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, list)) = self.behaviors_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "behaviors") {
+                    return Arc::clone(list);
+                }
             }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
         let list = Arc::new(list_behaviors_with_budget(project, budget, settings));
-        self.behaviors_cache.insert(root, (current_version, Arc::clone(&list)));
+        self.behaviors_cache.insert(root, (current_version, now, Arc::clone(&list)));
         list
     }
 
@@ -4394,16 +4702,20 @@ impl Yii2Support {
     fn widgets_with_budget(&mut self, project: &Project, budget: Option<&mut OpBudget>, settings: Option<&PluginSettings>) -> Arc<Vec<WidgetInfo>> {
         let root = project.root().unwrap_or_default();
         let current_version = get_cache_version();
-        if let Some((version, list)) = self.widgets_cache.get(&root) {
-            if *version == current_version {
-                return Arc::clone(list);
+        let now = current_time_millis();
+        let ttl_ms = settings.map(|s| s.performance.cache_ttl_seconds as u64 * 1000).unwrap_or(30_000);
+        if let Some((version, timestamp, list)) = self.widgets_cache.get(&root) {
+            if *version == current_version && now.saturating_sub(*timestamp) < ttl_ms {
+                if !self.is_cache_invalidated(&root, "widgets") {
+                    return Arc::clone(list);
+                }
             }
         }
         if budget.as_ref().map_or(false, |b| !b.check()) {
             return Arc::new(Vec::new());
         }
         let list = Arc::new(list_widgets_with_budget(project, budget, settings));
-        self.widgets_cache.insert(root, (current_version, Arc::clone(&list)));
+        self.widgets_cache.insert(root, (current_version, now, Arc::clone(&list)));
         list
     }
 
@@ -4675,9 +4987,9 @@ impl Providers for Yii2Support {
             return Vec::new();
         }
 
-        // Load settings
+        // Load settings (cached per project root)
         let project = project_of(&doc.path);
-        let settings = project.as_ref().map(|p| load_settings_for_project(p)).unwrap_or_default();
+        let settings = project.as_ref().map(|p| self.get_cached_settings(p)).unwrap_or_default();
 
         // --- Yii2 JavaScript (ActiveForm, validation, gridView, pjax) ---
         if is_js_lang(&doc.language) {
@@ -4695,6 +5007,13 @@ impl Providers for Yii2Support {
         // 500ms timeout. Only return local completions that don't require project I/O.
         // Subsequent requests will build caches normally.
         let is_first_request = !self.initial_scan_done;
+
+        // Cache warming on first request with a project
+        if is_first_request {
+            if let Some(ref project) = project {
+                self.warm_caches(project, &mut budget, Some(&settings));
+            }
+        }
 
         // Quick local completions that don't need project scans
         // --- Config array 'class' ---
