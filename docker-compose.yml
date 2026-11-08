@@ -1,0 +1,14 @@
+# Build plugin wasm into ./dist with host UID/GID ownership.
+#   UID=$(id -u) GID=$(id -g) docker compose run --rm build
+services:
+  build:
+    build:
+      context: .
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    environment:
+      UID: ${UID:-1000}
+      GID: ${GID:-1000}
+    volumes:
+      - ./dist:/out
